@@ -19,7 +19,6 @@ from nvidia_pipecat.frames.custom_view import (
     SelectableOption,
     SelectableOptionsGridBlock,
     StartCustomViewFrame,
-    Style,
     TableBlock,
     TextBlock,
     TextInputBlock,
@@ -73,7 +72,6 @@ def test_to_json_complex():
     Tests:
         - Multiple block types
         - Image handling
-        - Style configuration
         - Nested data structures
 
     Raises:
@@ -130,12 +128,6 @@ def test_to_json_complex():
                 input_type="text",
             ),
         ],
-        style=Style(
-            primary_color="#000001",
-            secondary_color="#000002",
-            primary_text_color="#000003",
-            secondary_text_color="#000004",
-        ),
     )
     result = frame.to_json()
     expected_result = {
@@ -207,11 +199,5 @@ def test_to_json_complex():
                 },
             },
         ],
-        "style": {
-            "primary_color": "#000001",
-            "secondary_color": "#000002",
-            "primary_text_color": "#000003",
-            "secondary_text_color": "#000004",
-        },
     }
     assert result == json.dumps(expected_result)

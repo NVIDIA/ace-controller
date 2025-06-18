@@ -5,13 +5,13 @@
 
 from dataclasses import dataclass
 
-from pipecat.frames.frames import ControlFrame
+from pipecat.frames.frames import SystemFrame
 
 from nvidia_pipecat.frames.action import ActionFrame
 
 
 @dataclass
-class UserUpdatedSpeakingTranscriptFrame(ControlFrame, ActionFrame):
+class UserUpdatedSpeakingTranscriptFrame(SystemFrame, ActionFrame):
     """A frame that contains user's partial transcript.
 
     Args:
@@ -22,7 +22,7 @@ class UserUpdatedSpeakingTranscriptFrame(ControlFrame, ActionFrame):
 
 
 @dataclass
-class UserStoppedSpeakingTranscriptFrame(ControlFrame, ActionFrame):
+class UserStoppedSpeakingTranscriptFrame(SystemFrame, ActionFrame):
     """A frame that contains the final user transcript.
 
     This frame usually comes after UserStoppedSpeakingFrame.
@@ -35,7 +35,7 @@ class UserStoppedSpeakingTranscriptFrame(ControlFrame, ActionFrame):
 
 
 @dataclass
-class BotUpdatedSpeakingTranscriptFrame(ControlFrame, ActionFrame):
+class BotUpdatedSpeakingTranscriptFrame(SystemFrame, ActionFrame):
     """A frame that contains bot's partial transcript.
 
     Args:

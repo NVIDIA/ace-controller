@@ -166,9 +166,10 @@ class TestRivaTTSService(unittest.TestCase):
         test_voice_id = "English-US.Male-1"
         test_sample_rate = 22050
         test_language = Language.ES_ES
-        test_quality = 10
+        test_zero_shot_quality = 10
         test_model = "custom-tts-model"
         test_dictionary = {"word": "pronunciation"}
+        test_audio_prompt_file = "test_audio.wav"
         # Test initialization with different parameters
         service = RivaTTSService(
             api_key=test_api_key,
@@ -176,9 +177,10 @@ class TestRivaTTSService(unittest.TestCase):
             voice_id=test_voice_id,
             sample_rate=test_sample_rate,
             language=test_language,
-            quality=test_quality,
+            zero_shot_quality=test_zero_shot_quality,
             model=test_model,
             custom_dictionary=test_dictionary,
+            zero_shot_audio_prompt_file=test_audio_prompt_file,
             use_ssl=True,
         )
 
@@ -187,9 +189,10 @@ class TestRivaTTSService(unittest.TestCase):
         self.assertEqual(service._voice_id, test_voice_id)
         self.assertEqual(service._sample_rate, test_sample_rate)
         self.assertEqual(service._language_code, test_language)
-        self.assertEqual(service._quality, test_quality)
+        self.assertEqual(service._zero_shot_quality, test_zero_shot_quality)
         self.assertEqual(service._model_name, test_model)
         self.assertEqual(service._custom_dictionary, test_dictionary)
+        self.assertEqual(service._zero_shot_audio_prompt_file, test_audio_prompt_file)
 
         # Verify Auth was called with correct parameters
         mock_auth.assert_called_with(

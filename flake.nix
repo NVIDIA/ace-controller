@@ -2,7 +2,7 @@
   description = "NVIDIA ACE Pipecat SDK";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-24.11";
+    nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     pyproject-nix = {
       url = "github:pyproject-nix/pyproject.nix";
@@ -48,6 +48,49 @@
         pyprojectOverrides = final: prev: {
           numba = prev.numba.overrideAttrs (old: {
             buildInputs = (old.buildInputs or []) ++ [pkgs.tbb_2021_11];
+          });
+          semantic-version = prev.semantic-version.overrideAttrs (old: {
+            nativeBuildInputs =
+              old.nativeBuildInputs
+              ++ final.resolveBuildSystem {
+                setuptools = [];
+                wheel = [];
+              };
+          });
+
+          setuptools-scm = prev.setuptools-scm.overrideAttrs (old: {
+            nativeBuildInputs =
+              old.nativeBuildInputs
+              ++ final.resolveBuildSystem {
+                setuptools = [];
+                wheel = [];
+              };
+          });
+
+          setuptools-rust = prev.setuptools-rust.overrideAttrs (old: {
+            nativeBuildInputs =
+              old.nativeBuildInputs
+              ++ final.resolveBuildSystem {
+                setuptools = [];
+                wheel = [];
+              };
+          });
+
+          libcst = prev.libcst.overrideAttrs (old: {
+            nativeBuildInputs =
+              old.nativeBuildInputs
+              ++ final.resolveBuildSystem {
+                setuptools = [];
+                wheel = [];
+              };
+          });
+          nvidia-pipecat = prev.nvidia-pipecat.overrideAttrs (old: {
+            nativeBuildInputs =
+              old.nativeBuildInputs
+              ++ final.resolveBuildSystem {
+                hatchling = [];
+                editables = [];
+              };
           });
         };
 

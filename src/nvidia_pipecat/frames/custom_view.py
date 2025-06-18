@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 
+from pipecat.frames.frames import DataFrame
 from pydantic import BaseModel, Field
 
 from nvidia_pipecat.frames.action import (
@@ -263,30 +264,6 @@ class TextInputBlock(Block):
         return "text_input"
 
 
-# Style data
-class Style(BaseModel):
-    """Defines the styling configuration for the UI display.
-
-    Args:
-        primary_color (str | None): The primary color of the style. Default is NVIDIA green (#76B900).
-        secondary_color (str | None): The secondary color of the style. Default is grey (#616161).
-        background_color (str | None): The background color of the style. Default is dark grey (#292929).
-        background_text_color (str | None): Dictates the color of the text to be displayed on top of the
-            background color. Default is white (#FFFFFF).
-        primary_text_color (str | None): Dictates the color of the text to be displayed on top of the
-            primary color. Default is white (#FFFFFF).
-        secondary_text_color (str | None): Dictates the color of the text to be displayed on top of the
-            secondary color. Default is white (#FFFFFF).
-    """
-
-    primary_color: str | None = None
-    secondary_color: str | None = None
-    background_color: str | None = None
-    background_text_color: str | None = None
-    primary_text_color: str | None = None
-    secondary_text_color: str | None = None
-
-
 @dataclass
 class StartCustomViewFrame(StartActionFrame):
     """Sends data to the UI in the form of modular components to be rendered.
@@ -297,7 +274,6 @@ class StartCustomViewFrame(StartActionFrame):
     """
 
     blocks: list[Block] | None = None
-    style: Style | None = None
 
     def to_json(self) -> str:
         """Convert the frame to a JSON string.
@@ -315,8 +291,6 @@ class StartCustomViewFrame(StartActionFrame):
                 }
                 blocks_list_json.append(block_json)
             the_json["blocks"] = blocks_list_json
-        if self.style:
-            the_json["style"] = self.style.model_dump(exclude_none=True)
         return json.dumps(the_json)
 
 
@@ -326,55 +300,58 @@ class StopCustomViewFrame(StopActionFrame):
 
 
 @dataclass
-class UIInterimTextInputFrame(UserActionFrame):
+class UIInterimTextInputFrame(UserActionFrame, DataFrame):
     """Interim text input frame from the UI.
 
     Receives data from the UI in the form of text inputted into a textbox
     by the user prior to submission.
 
     Args:
-        id (str): The id of the text input which is currently being typed in.
+        component_id (str): The id of the text input which is currently being typed in.
         interim_input (str): The interim input of the text input.
     """
 
-    id: str
+    component_id: str
     interim_input: str
 
 
 @dataclass
-class UITextInputFrame(UserActionFrame):
+class UITextInputFrame(UserActionFrame, DataFrame):
     """A frame that receives data from the UI in the form of a text inputted into a textbox.
 
     This is triggered when the user submits their input.
 
     Args:
-        id (str): The id of the text input which was submitted.
+        enter_pressed (bool): True if the enter key was pressed to submit the text input,
+            false if the user navigated away from the text input.
+        component_id (str): The id of the text input which was submitted.
         input (str): The input of the text input.
     """
 
-    id: str
+    enter_pressed: bool
+    component_id: str
     input: str
 
 
 @dataclass
-class UIButtonPressFrame(UserActionFrame):
+class UIButtonPressFrame(UserActionFrame, DataFrame):
     """A frame that receives data from the UI in the form of a button press.
 
     Args:
-        id (str): The id of the button which was pressed.
+        component_id (str): The id of the button which was pressed.
     """
 
-    id: str
+    component_id: str
 
 
 @dataclass
-class UISelectableOptionPressFrame(UserActionFrame):
+class UISelectableOptionPressFrame(UserActionFrame, DataFrame):
     """A frame that receives data from the UI in the form of a selectable option press.
 
     Args:
-        id (str): The id of the selectable option which was pressed.
+        component_id (str): The id of the selectable option which was pressed.
         toggled (bool): Whether the option is toggled. If true, the option will be toggled on.
     """
 
-    id: str
+    component_id: str
     toggled: bool

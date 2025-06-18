@@ -25,3 +25,6 @@ output/
 
 # Ignore docs
 docs/build/
+
+# Ignore .DS_Store
+.DS_Store

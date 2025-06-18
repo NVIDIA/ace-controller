@@ -171,8 +171,17 @@ class TestRivaASRService(unittest.TestCase):
         """Test the start method of RivaASRService."""
         # Arrange
         service = RivaASRService(api_key="test_api_key")
-        service.create_task = AsyncMock()
-        service._response_task_handler = AsyncMock()
+
+        # Create a completed mock task for expected return value
+        mock_task = MagicMock()
+        mock_task.done.return_value = True
+
+        # Use MagicMock to avoid coroutine awaiting issues
+        service.create_task = MagicMock(return_value=mock_task)
+
+        # Mock the response task handler
+        mock_response_coro = MagicMock()
+        service._response_task_handler = MagicMock(return_value=mock_response_coro)
 
         # Create a mock StartFrame with the necessary attributes
         mock_start_frame = MagicMock(spec=StartFrame)
@@ -186,7 +195,7 @@ class TestRivaASRService(unittest.TestCase):
 
         # Assert
         # Verify create_task was called with the right handlers
-        self.assertEqual(service.create_task.call_count, 1)
+        service.create_task.assert_called_once_with(mock_response_coro)
 
     @patch("nvidia_pipecat.services.riva_speech.riva.client.Auth")
     @patch("nvidia_pipecat.services.riva_speech.riva.client.ASRService")
@@ -237,7 +246,17 @@ class TestRivaASRService(unittest.TestCase):
         # Arrange
         service = RivaASRService(api_key="test_api_key")
         service._queue = AsyncMock()
-        service._task_manager = AsyncMock()
+
+        # Create a completed mock task and mock thread task handler
+        mock_task = MagicMock()
+        mock_task.done.return_value = True
+
+        mock_thread_coro = MagicMock()
+        service._thread_task_handler = MagicMock(return_value=mock_thread_coro)
+        service._thread_task = mock_task
+
+        # Mock the create_task method to return our mock task and avoid coroutine warnings
+        service.create_task = MagicMock(return_value=mock_task)
 
         # Act
         async def run_test():
@@ -251,6 +270,7 @@ class TestRivaASRService(unittest.TestCase):
             # run_stt yields a single None frame for RivaASRService
             self.assertEqual(len(frames), 1)
             self.assertIsNone(frames[0])
+            service.create_task.assert_called_once_with(mock_thread_coro)
 
         # Run the test
         asyncio.run(run_test())
@@ -273,6 +293,8 @@ class TestRivaASRService(unittest.TestCase):
         # Arrange
         service = RivaASRService(api_key="test_api_key")
         service.push_frame = AsyncMock()
+
+        # Use MagicMock instead of asyncio.Future to avoid event loop issues
         service.stop_ttfb_metrics = AsyncMock()
         service.stop_processing_metrics = AsyncMock()
 
@@ -313,6 +335,8 @@ class TestRivaASRService(unittest.TestCase):
         # Arrange
         service = RivaASRService(api_key="test_api_key")
         service.push_frame = AsyncMock()
+
+        # Use AsyncMock directly instead of Future
         service.stop_ttfb_metrics = AsyncMock()
 
         # Create a mock response with interim transcript
@@ -368,7 +392,7 @@ class TestRivaASRService(unittest.TestCase):
         service = RivaASRService(api_key="test_api_key", generate_interruptions=True)
         service.push_frame = AsyncMock()
 
-        # Mock the private methods instead of setting the property
+        # Use AsyncMock directly instead of Future
         service._start_interruption = AsyncMock()
         service._stop_interruption = AsyncMock()
 
@@ -431,8 +455,24 @@ async def test_riva_asr_integration():
         # Mock the _stop_tasks method directly instead of relying on task_manager
         service._stop_tasks = AsyncMock()
 
-        # Mock other methods to avoid complex task management
-        service.create_task = MagicMock(return_value=AsyncMock())
+        # Create mock coroutines for handlers
+        thread_coro = MagicMock()
+        response_coro = MagicMock()
+
+        # Mock the handler methods to return the coroutines
+        service._thread_task_handler = MagicMock(return_value=thread_coro)
+        service._response_task_handler = MagicMock(return_value=response_coro)
+
+        # Create a mock task that's already completed
+        mock_task = MagicMock()
+        mock_task.done.return_value = True
+
+        # Mock task creation to return our completed task
+        service.create_task = MagicMock(return_value=mock_task)
+
+        # Set the tasks to our mock task
+        service._thread_task = mock_task
+        service._response_task = mock_task
 
         # Create a mock result for testing
         mock_result = MagicMock()
@@ -450,6 +490,9 @@ async def test_riva_asr_integration():
         # Start the service with a start frame
         await service.start(mock_start_frame)
 
+        # Verify response task was created
+        service.create_task.assert_called_with(response_coro)
+
         # Put a mock response in the queue
         await service._response_queue.put(mock_response)
 
@@ -464,6 +507,9 @@ async def test_riva_asr_integration():
         # Verify results
         assert len(frames) == 1
         assert frames[0] is None
+
+        # Verify thread task was created
+        service.create_task.assert_any_call(thread_coro)
 
         # Simulate stopping the service
         mock_end_frame = MagicMock(spec=EndFrame)

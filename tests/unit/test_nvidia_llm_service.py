@@ -3,513 +3,384 @@
 
 """Unit tests for the NvidiaLLMService.
 
-This module contains tests for the NvidiaLLMService class, covering initialization,
-frame processing, context aggregation, streaming, and pipeline integration.
+This module contains tests for the NvidiaLLMService class, focusing on core functionalities:
+- Think token filtering (including split tag handling)
+- Mistral message preprocessing
+- Token usage tracking
+- LLM responses and function calls
 """
 
-import asyncio
-import contextlib
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import DEFAULT, AsyncMock, patch
 
 import pytest
-from pipecat.frames.frames import (
-    LLMFullResponseEndFrame,
-    LLMFullResponseStartFrame,
-    LLMMessagesFrame,
-    LLMUpdateSettingsFrame,
-    TextFrame,
-)
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext, OpenAILLMContextFrame
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.frames.frames import LLMTextFrame
+from pipecat.metrics.metrics import LLMTokenUsage
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 
 from nvidia_pipecat.services.nvidia_llm import NvidiaLLMService
-from tests.unit.utils import FrameStorage, ignore_ids, run_interactive_test
 
 
-# Create a simple mock implementation of BaseMessageChunk that doesn't use Pydantic
-class MockMessageChunk:
-    """Simple mock implementation of BaseMessageChunk for testing."""
+# Custom mocks that mimic OpenAI classes without inheriting from them
+class MockCompletionUsage:
+    """Mock for CompletionUsage that mimics the structure."""
 
-    def __init__(self, content=None):
-        """Initialize with optional content."""
-        self._content = content
-        self._message = {"content": content}
+    def __init__(self, prompt_tokens, completion_tokens, total_tokens):
+        """Initialize with token usage counts.
 
-    @property
-    def type(self):
-        """Return the type of the message."""
-        return "mock"
-
-    @property
-    def content(self):
-        """Return the content of the message."""
-        return self._content
-
-    @content.setter
-    def content(self, value):
-        """Set the content of the message."""
-        self._content = value
-        self._message["content"] = value
-
-    def __eq__(self, other):
-        """Implement equality check for testing."""
-        if not isinstance(other, MockMessageChunk):
-            return False
-        return self.content == other.content
+        Args:
+            prompt_tokens: Number of tokens in the prompt
+            completion_tokens: Number of tokens in the completion
+            total_tokens: Total number of tokens
+        """
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = total_tokens
 
 
-class MockAsyncIterator:
-    """A mock async iterator for testing."""
+class MockChoiceDelta:
+    """Mock for ChoiceDelta that mimics the structure."""
 
-    def __init__(self, items):
-        """Initialize with a list of items to yield."""
-        self.items = items
+    def __init__(self, content=None, tool_calls=None):
+        """Initialize with optional content and tool calls.
+
+        Args:
+            content: The text content of the delta
+            tool_calls: List of tool calls in the delta
+        """
+        self.content = content
+        self.tool_calls = tool_calls
+        self.function_call = None
+        self.role = None
+
+
+class MockChoice:
+    """Mock for Choice that mimics the structure."""
+
+    def __init__(self, delta, index=0, finish_reason=None):
+        """Initialize with delta, index, and finish reason.
+
+        Args:
+            delta: The delta containing content or tool calls
+            index: The index of this choice
+            finish_reason: Reason for finishing generation
+        """
+        self.delta = delta
+        self.index = index
+        self.finish_reason = finish_reason
+
+
+class MockChatCompletionChunk:
+    """Mock for ChatCompletionChunk that mimics the structure."""
+
+    def __init__(self, content=None, usage=None, id="mock-id", tool_calls=None):
+        """Initialize a mock of ChatCompletionChunk.
+
+        Args:
+            content: The text content in the chunk
+            usage: Token usage information
+            id: Chunk identifier
+            tool_calls: Any tool calls in the chunk
+        """
+        self.id = id
+        self.model = "mock-model"
+        self.object = "chat.completion.chunk"
+        self.created = 1234567890
+        self.usage = usage
+
+        if tool_calls:
+            self.choices = [MockChoice(MockChoiceDelta(tool_calls=tool_calls))]
+        else:
+            self.choices = [MockChoice(MockChoiceDelta(content=content))]
+
+
+class MockToolCall:
+    """Mock for ToolCall."""
+
+    def __init__(self, id="tool-id", function=None, index=0, type="function"):
+        """Initialize a tool call.
+
+        Args:
+            id: Tool call identifier
+            function: The function being called
+            index: Index of this tool call
+            type: Type of tool call
+        """
+        self.id = id
+        self.function = function
+        self.index = index
+        self.type = type
+
+
+class MockFunction:
+    """Mock for Function in a tool call."""
+
+    def __init__(self, name="", arguments=""):
+        """Initialize a function with name and arguments.
+
+        Args:
+            name: Name of the function
+            arguments: JSON string of function arguments
+        """
+        self.name = name
+        self.arguments = arguments
+
+
+class MockAsyncStream:
+    """Mock implementation of AsyncStream for testing."""
+
+    def __init__(self, chunks):
+        """Initialize with a list of chunks to yield.
+
+        Args:
+            chunks: List of chunks to return when iterating
+        """
+        self.chunks = chunks
 
     def __aiter__(self):
         """Return self as an async iterator."""
         return self
 
     async def __anext__(self):
-        """Return the next item or raise StopAsyncIteration."""
-        if not self.items:
+        """Return the next chunk or raise StopAsyncIteration."""
+        if not self.chunks:
             raise StopAsyncIteration
-        return self.items.pop(0)
+        return self.chunks.pop(0)
 
 
 @pytest.mark.asyncio
-async def test_nvidia_llm_service_initialization():
-    """Tests NvidiaLLMService initialization with various configurations.
+async def test_mistral_message_preprocessing():
+    """Test the Mistral message preprocessing functionality."""
+    service = NvidiaLLMService(api_key="test_api_key", mistral_model_support=True)
 
-    Tests service initialization with different parameters including default settings,
-    custom models, and custom input parameters.
+    # Test with alternating roles (already valid)
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi there!"},
+        {"role": "user", "content": "How are you?"},
+    ]
+    processed = service._preprocess_messages_for_mistral(messages)
+    assert len(processed) == len(messages)  # No changes needed
 
-    The test verifies:
-        - Default initialization parameters are set correctly
-        - Custom model name is properly assigned
-        - Input parameters are correctly stored
-        - Metrics generation capability is configured
-    """
-    # Use a patched create_client to avoid external API calls
-    with patch.object(NvidiaLLMService, "create_client") as mock_create_client:
-        mock_create_client.return_value = MagicMock()
+    # Test with consecutive messages from same role
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello"},
+        {"role": "user", "content": "How are you?"},
+    ]
+    processed = service._preprocess_messages_for_mistral(messages)
+    assert len(processed) == 2  # System + combined user
+    assert processed[1]["role"] == "user"
+    assert processed[1]["content"] == "Hello How are you?"
 
-        # Test default initialization
-        service = NvidiaLLMService(api_key="test_api_key")
-        # Only check that the model name is a string, no restrictions on what it can be
-        assert isinstance(service.model_name, str)
-        assert service.can_generate_metrics() is True
-
-        # Test initialization with custom model
-        custom_model = "custom-model"
-        service = NvidiaLLMService(model=custom_model, api_key="test_api_key")
-        assert service.model_name == custom_model
-
-        # Test initialization with custom parameters
-        params = NvidiaLLMService.InputParams(
-            temperature=0.8,
-            top_p=0.9,
-            max_tokens=500,
-            frequency_penalty=0.2,
-            presence_penalty=0.1,
-            seed=42,
-            max_completion_tokens=1000,
-            extra={"custom_param": "value"},
-        )
-        service = NvidiaLLMService(api_key="test_api_key", params=params)
-        # Check that parameters are stored but don't restrict what values they can have
-        assert service._settings["temperature"] == 0.8
-        assert service._settings["top_p"] == 0.9
-        assert service._settings["max_tokens"] == 500
-        assert service._settings["max_completion_tokens"] == 1000
-        assert service._settings["frequency_penalty"] == 0.2
-        assert service._settings["presence_penalty"] == 0.1
-        assert service._settings["seed"] == 42
-        assert service._settings["extra"] == {"custom_param": "value"}
+    # Test with system message at end
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {"role": "system", "content": "You are a helpful assistant."},
+    ]
+    processed = service._preprocess_messages_for_mistral(messages)
+    assert len(processed) == 2  # User + system
+    assert processed[0]["role"] == "user"
+    assert processed[1]["role"] == "system"
 
 
 @pytest.mark.asyncio
-async def test_context_aggregator_creation():
-    """Tests creation of context aggregators.
+async def test_filter_think_token_simple():
+    """Test the basic think token filtering functionality."""
+    service = NvidiaLLMService(api_key="test_api_key", filter_think_tokens=True)
+    service._reset_think_filter_state()
 
-    Tests the creation of user and assistant context aggregators with
-    different configuration options.
+    # Test with simple think content followed by real content
+    content = "I'm thinking about the answer</think>This is the actual response"
+    filtered = service._filter_think_token(content)
+    assert filtered == "This is the actual response"
+    assert service._seen_end_tag is True
 
-    The test verifies:
-        - User and assistant aggregators are created
-        - Custom parameters are properly applied
-        - Aggregator pair structure is correct
-    """
-    context = OpenAILLMContext(messages=[{"role": "system", "content": "You are a helpful assistant."}])
-
-    # Create aggregator pair
-    pair = NvidiaLLMService.create_context_aggregator(context)
-
-    # Check that the pair has user and assistant aggregators
-    assert pair._user is not None
-    assert pair._assistant is not None
-
-    # Check with custom parameters - access private attribute through the object's dict
-    pair = NvidiaLLMService.create_context_aggregator(context, assistant_expect_stripped_words=False)
-    assert pair._assistant._expect_stripped_words is False
+    # Subsequent content should pass through untouched
+    more_content = " and some more text"
+    filtered = service._filter_think_token(more_content)
+    assert filtered == " and some more text"
 
 
 @pytest.mark.asyncio
-async def test_process_llm_messages_frame():
-    """Tests processing of LLMMessagesFrame.
+async def test_filter_think_token_split():
+    """Test the think token filtering with split tags."""
+    service = NvidiaLLMService(api_key="test_api_key", filter_think_tokens=True)
+    service._reset_think_filter_state()
 
-    Tests the complete flow of processing an LLMMessagesFrame including metrics,
-    streaming, and frame generation.
+    # First part with beginning of tag
+    content1 = "Let me think about this problem<"
+    filtered1 = service._filter_think_token(content1)
+    assert filtered1 == ""  # No output yet
+    assert service._partial_tag_buffer == "<"  # Partial tag saved
 
-    The test verifies:
-        - Metrics start/stop timing
-        - Correct frame sequence generation
-        - Text chunk processing
-        - Response start/end frame generation
-    """
-    with patch("nvidia_pipecat.services.nvidia_llm.ChatNVIDIA") as MockChatNVIDIA:
-        # Setup the mock ChatNVIDIA
-        mock_client = MagicMock()
-        MockChatNVIDIA.return_value = mock_client
+    # Second part with rest of tag and response
+    content2 = "/think>Here's the answer"
+    filtered2 = service._filter_think_token(content2)
+    assert filtered2 == "Here's the answer"  # Output after tag
+    assert service._seen_end_tag is True
 
-        # Setup mock astream to return chunks via async iterator
-        chunks = [MockMessageChunk("Hello"), MockMessageChunk(" world!")]
-        mock_client.astream.return_value = MockAsyncIterator(chunks)
 
-        # Initialize service and mock push_frame
-        service = NvidiaLLMService(api_key="test_api_key")
-        service.push_frame = AsyncMock()
-        service.start_ttfb_metrics = AsyncMock()
-        service.stop_ttfb_metrics = AsyncMock()
-        service.start_processing_metrics = AsyncMock()
-        service.stop_processing_metrics = AsyncMock()
+@pytest.mark.asyncio
+async def test_filter_think_token_no_tag():
+    """Test what happens when no think tag is found."""
+    service = NvidiaLLMService(api_key="test_api_key", filter_think_tokens=True)
+    service._reset_think_filter_state()
 
-        # Create an LLMMessagesFrame
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Tell me about the weather."},
+    # Add some content in multiple chunks
+    filtered1 = service._filter_think_token("This is a response")
+    filtered2 = service._filter_think_token(" with no think tag")
+    # Verify filtering behavior
+    assert filtered1 == filtered2 == ""  # No output during filtering
+    assert service._thinking_aggregation == "This is a response with no think tag"
+    # Test end-of-processing behavior
+    service.push_frame = AsyncMock()
+    await service.push_frame(LLMTextFrame(service._thinking_aggregation))
+    service._reset_think_filter_state()
+    # Verify results
+    service.push_frame.assert_called_once()
+    assert service.push_frame.call_args.args[0].text == "This is a response with no think tag"
+    assert service._thinking_aggregation == ""  # State was reset
+
+
+@pytest.mark.asyncio
+async def test_token_usage_tracking():
+    """Test the token usage tracking functionality."""
+    service = NvidiaLLMService(api_key="test_api_key")
+    service._is_processing = True
+
+    # Test initial accumulation of prompt tokens
+    tokens1 = LLMTokenUsage(prompt_tokens=10, completion_tokens=0, total_tokens=10)
+    await service.start_llm_usage_metrics(tokens1)
+    assert service._prompt_tokens == 10
+    assert service._has_reported_prompt_tokens is True
+
+    # Test incremental completion tokens
+    tokens2 = LLMTokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    await service.start_llm_usage_metrics(tokens2)
+    assert service._completion_tokens == 5
+
+    # Test more completion tokens
+    tokens3 = LLMTokenUsage(prompt_tokens=10, completion_tokens=8, total_tokens=18)
+    await service.start_llm_usage_metrics(tokens3)
+    assert service._completion_tokens == 8
+
+    # Test reporting duplicate prompt tokens
+    tokens4 = LLMTokenUsage(prompt_tokens=10, completion_tokens=10, total_tokens=20)
+    await service.start_llm_usage_metrics(tokens4)
+    assert service._prompt_tokens == 10  # Unchanged
+    assert service._completion_tokens == 10
+
+
+@pytest.mark.asyncio
+async def test_process_context_with_think_filtering():
+    """Test the full processing with think token filtering."""
+    with patch.multiple(
+        NvidiaLLMService,
+        create_client=DEFAULT,
+        _stream_chat_completions=DEFAULT,
+        start_ttfb_metrics=DEFAULT,
+        stop_ttfb_metrics=DEFAULT,
+        push_frame=DEFAULT,
+    ) as mocks:
+        service = NvidiaLLMService(api_key="test_api_key", filter_think_tokens=True)
+        mock_push_frame = mocks["push_frame"]
+
+        # Setup mock stream
+        chunks = [
+            MockChatCompletionChunk(content="Thinking<"),
+            MockChatCompletionChunk(content="/think>Real content"),
+            MockChatCompletionChunk(content=" continues"),
         ]
-        frame = LLMMessagesFrame(messages)
+        mocks["_stream_chat_completions"].return_value = MockAsyncStream(chunks)
 
-        # Process the frame
-        await service.process_frame(frame, FrameDirection.DOWNSTREAM)
+        # Process context
+        context = OpenAILLMContext(messages=[{"role": "user", "content": "Test query"}])
+        await service._process_context(context)
 
-        # Verify that start metrics was called
-        service.start_processing_metrics.assert_called_once()
-        service.start_ttfb_metrics.assert_called_once()
-
-        # Verify that TextFrames were pushed for the chunks
-        assert service.push_frame.call_count >= 4  # Start, 2 chunks, End
-
-        # Find LLMFullResponseStartFrame
-        start_frame_found = False
-        for call_args in service.push_frame.call_args_list:
-            if isinstance(call_args.args[0], LLMFullResponseStartFrame):
-                start_frame_found = True
-                break
-        assert start_frame_found, "LLMFullResponseStartFrame was not pushed"
-
-        # Find TextFrames
-        text_frames_found = 0
-        expected_texts = ["Hello", " world!"]
-        for call_args in service.push_frame.call_args_list:
-            if isinstance(call_args.args[0], TextFrame):
-                assert call_args.args[0].text in expected_texts
-                text_frames_found += 1
-        assert text_frames_found == 2, f"Expected 2 TextFrames, found {text_frames_found}"
-
-        # Find LLMFullResponseEndFrame
-        end_frame_found = False
-        for call_args in service.push_frame.call_args_list:
-            if isinstance(call_args.args[0], LLMFullResponseEndFrame):
-                end_frame_found = True
-                break
-        assert end_frame_found, "LLMFullResponseEndFrame was not pushed"
-
-        # Verify that stop metrics was called
-        service.stop_processing_metrics.assert_called_once()
+        # Verify frame content - empty frames during thinking, content after tag
+        frames = [call.args[0].text for call in mock_push_frame.call_args_list]
+        assert frames == ["", "Real content", " continues"]
 
 
 @pytest.mark.asyncio
-async def test_process_openai_llm_context_frame():
-    """Tests processing of OpenAILLMContextFrame.
-
-    Tests the handling of OpenAILLMContextFrame including context conversion
-    and response generation.
-
-    The test verifies:
-        - Context processing
-        - Metrics handling
-        - Text frame generation
-        - Response streaming
-    """
-    with patch("nvidia_pipecat.services.nvidia_llm.ChatNVIDIA") as MockChatNVIDIA:
-        # Setup the mock ChatNVIDIA
-        mock_client = MagicMock()
-        MockChatNVIDIA.return_value = mock_client
-
-        # Setup mock astream to return chunks
-        chunks = [MockMessageChunk("Response"), MockMessageChunk(" text")]
-        mock_client.astream.return_value = MockAsyncIterator(chunks)
-
-        # Initialize service and mock push_frame
+async def test_process_context_with_function_calls():
+    """Test handling of function calls from LLM."""
+    with (
+        patch.object(NvidiaLLMService, "create_client"),
+        patch.object(NvidiaLLMService, "_stream_chat_completions") as mock_stream,
+        patch.object(NvidiaLLMService, "has_function") as mock_has_function,
+        patch.object(NvidiaLLMService, "call_function") as mock_call_function,
+    ):
         service = NvidiaLLMService(api_key="test_api_key")
-        service.push_frame = AsyncMock()
-        service.start_ttfb_metrics = AsyncMock()
-        service.stop_ttfb_metrics = AsyncMock()
-        service.start_processing_metrics = AsyncMock()
-        service.stop_processing_metrics = AsyncMock()
 
-        # Create an OpenAILLMContextFrame
+        # Create tool call chunks that come in parts
+        tool_call1 = MockToolCall(
+            id="call1", function=MockFunction(name="get_weather", arguments='{"location"'), index=0
+        )
+
+        tool_call2 = MockToolCall(id="call1", function=MockFunction(name="", arguments=':"New York"}'), index=0)
+
+        # Create chunks with tool calls
+        chunk1 = MockChatCompletionChunk(tool_calls=[tool_call1], id="chunk1")
+        chunk2 = MockChatCompletionChunk(tool_calls=[tool_call2], id="chunk2")
+
+        mock_stream.return_value = MockAsyncStream([chunk1, chunk2])
+        mock_has_function.return_value = True
+        mock_call_function.return_value = None
+
+        # Process a context
+        context = OpenAILLMContext(messages=[{"role": "user", "content": "What's the weather in New York?"}])
+        await service._process_context(context)
+
+        # Verify function was called with combined arguments
+        mock_call_function.assert_called_once()
+        args = mock_call_function.call_args.kwargs
+        assert args["function_name"] == "get_weather"
+        assert args["arguments"] == {"location": "New York"}
+        assert args["tool_call_id"] == "call1"
+
+
+@pytest.mark.asyncio
+async def test_process_context_with_mistral_preprocessing():
+    """Test processing context with Mistral message preprocessing."""
+    with (
+        patch.object(NvidiaLLMService, "create_client"),
+        patch.object(NvidiaLLMService, "_stream_chat_completions") as mock_stream,
+    ):
+        service = NvidiaLLMService(api_key="test_api_key", mistral_model_support=True)
+
+        # Setup mock stream
+        chunks = [MockChatCompletionChunk(content="I am a response")]
+        mock_stream.return_value = MockAsyncStream(chunks)
+
+        # Test 1: Combining consecutive user messages
         context = OpenAILLMContext(
             messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "system", "content": "You are helpful."},
                 {"role": "user", "content": "Hello"},
+                {"role": "user", "content": "How are you?"},
             ]
         )
-        frame = OpenAILLMContextFrame(context=context)
+        await service._process_context(context)
 
-        # Process the frame
-        await service.process_frame(frame, FrameDirection.DOWNSTREAM)
+        # Verify messages were combined
+        processed_messages = context.get_messages()
+        assert len(processed_messages) == 2  # System + combined user
+        assert processed_messages[1]["role"] == "user"
+        assert processed_messages[1]["content"] == "Hello How are you?"
 
-        # Verify metrics and frames similarly to the previous test
-        service.start_processing_metrics.assert_called_once()
-        service.start_ttfb_metrics.assert_called_once()
+        # Verify stream was called (normal processing)
+        mock_stream.assert_called_once()
 
-        # Find TextFrames
-        text_frames_found = 0
-        expected_texts = ["Response", " text"]
-        for call_args in service.push_frame.call_args_list:
-            if isinstance(call_args.args[0], TextFrame):
-                assert call_args.args[0].text in expected_texts
-                text_frames_found += 1
-        assert text_frames_found == 2, f"Expected 2 TextFrames, found {text_frames_found}"
+        # Test 2: System message only - should skip processing
+        mock_stream.reset_mock()
+        system_only_context = OpenAILLMContext(
+            messages=[
+                {"role": "system", "content": "You are helpful."},
+            ]
+        )
+        await service._process_context(system_only_context)
 
-
-@pytest.mark.asyncio
-async def test_update_settings():
-    """Tests dynamic settings updates.
-
-    Tests the ability to update service settings using LLMUpdateSettingsFrame.
-
-    The test verifies:
-        - Settings are updated correctly
-        - Previous settings are overwritten
-        - Frame is not propagated downstream
-    """
-    # Initialize service with a mock client to avoid API calls
-    with patch.object(NvidiaLLMService, "create_client") as mock_create_client:
-        mock_create_client.return_value = MagicMock()
-
-        service = NvidiaLLMService(api_key="test_api_key")
-        service.push_frame = AsyncMock()
-
-        # Initial settings
-        assert service._settings["temperature"] is None
-
-        # Create an LLMUpdateSettingsFrame
-        settings = {"temperature": 0.7, "top_p": 0.8, "max_tokens": 300}
-        frame = LLMUpdateSettingsFrame(settings)
-
-        # Process the frame
-        await service.process_frame(frame, FrameDirection.DOWNSTREAM)
-
-        # Verify settings were updated
-        assert service._settings["temperature"] == 0.7
-        assert service._settings["top_p"] == 0.8
-        assert service._settings["max_tokens"] == 300
-
-        # Verify frame was not pushed downstream
-        service.push_frame.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_regular_frame_passing():
-    """Test that regular frames are passed through."""
-    # Initialize service with a mock client to avoid API calls
-    with patch.object(NvidiaLLMService, "create_client") as mock_create_client:
-        mock_create_client.return_value = MagicMock()
-
-        service = NvidiaLLMService(api_key="test_api_key")
-        service.push_frame = AsyncMock()
-
-        # Create a regular frame
-        frame = TextFrame("Hello")
-
-        # Process the frame
-        await service.process_frame(frame, FrameDirection.DOWNSTREAM)
-
-        # Verify frame was pushed downstream
-        service.push_frame.assert_called_once_with(frame, FrameDirection.DOWNSTREAM)
-
-
-@pytest.mark.asyncio
-async def test_streaming_cancellation():
-    """Tests streaming cancellation handling.
-
-    Tests the service's behavior when streaming is cancelled mid-response.
-
-    The test verifies:
-        - Initial chunks are processed
-        - Cancellation is handled gracefully
-        - Cleanup occurs properly
-        - Metrics are stopped appropriately
-    """
-    with patch("nvidia_pipecat.services.nvidia_llm.ChatNVIDIA") as MockChatNVIDIA:
-        # Setup the mock ChatNVIDIA
-        mock_client = MagicMock()
-        MockChatNVIDIA.return_value = mock_client
-
-        # Create an async iterator that will raise CancelledError
-        class CancellingAsyncIterator:
-            """An async iterator that raises a CancelledError after yielding one item."""
-
-            def __aiter__(self):
-                """Return self as an async iterator."""
-                return self
-
-            async def __anext__(self):
-                """Return one item then raise CancelledError."""
-                if not hasattr(self, "yielded"):
-                    self.yielded = True
-                    return MockMessageChunk("First chunk")
-                raise asyncio.CancelledError()
-
-        mock_client.astream.return_value = CancellingAsyncIterator()
-
-        # Initialize service and mock push_frame
-        service = NvidiaLLMService(api_key="test_api_key")
-        service.push_frame = AsyncMock()
-        service.start_ttfb_metrics = AsyncMock()
-        service.stop_ttfb_metrics = AsyncMock()
-        service.start_processing_metrics = AsyncMock()
-        service.stop_processing_metrics = AsyncMock()
-
-        # Create an LLMMessagesFrame
-        messages = [{"role": "user", "content": "Hello"}]
-        frame = LLMMessagesFrame(messages)
-
-        # Process the frame - it should handle the cancellation
-        with contextlib.suppress(asyncio.CancelledError):
-            await service.process_frame(frame, FrameDirection.DOWNSTREAM)
-
-        # Verify that at least the first chunk was processed
-        text_frame_found = False
-        for call_args in service.push_frame.call_args_list:
-            if isinstance(call_args.args[0], TextFrame) and call_args.args[0].text == "First chunk":
-                text_frame_found = True
-                break
-        assert text_frame_found, "The first chunk wasn't processed before cancellation"
-
-
-@pytest.mark.asyncio
-async def test_empty_content_skipping():
-    """Test that empty content chunks are skipped."""
-    with patch("nvidia_pipecat.services.nvidia_llm.ChatNVIDIA") as MockChatNVIDIA:
-        # Setup the mock ChatNVIDIA
-        mock_client = MagicMock()
-        MockChatNVIDIA.return_value = mock_client
-
-        # Setup mock astream to return chunks, including an empty one
-        chunks = [
-            MockMessageChunk("First"),
-            MockMessageChunk(""),  # Empty content
-            MockMessageChunk(" content"),
-        ]
-        mock_client.astream.return_value = MockAsyncIterator(chunks)
-
-        # Initialize service and mock push_frame
-        service = NvidiaLLMService(api_key="test_api_key")
-        service.push_frame = AsyncMock()
-        service.start_ttfb_metrics = AsyncMock()
-        service.stop_ttfb_metrics = AsyncMock()
-        service.start_processing_metrics = AsyncMock()
-        service.stop_processing_metrics = AsyncMock()
-
-        # Create an LLMMessagesFrame
-        messages = [{"role": "user", "content": "Hello"}]
-        frame = LLMMessagesFrame(messages)
-
-        # Process the frame
-        await service.process_frame(frame, FrameDirection.DOWNSTREAM)
-
-        # Count TextFrames - should be 2, not 3
-        text_frames_count = 0
-        for call_args in service.push_frame.call_args_list:
-            if isinstance(call_args.args[0], TextFrame):
-                text_frames_count += 1
-        assert text_frames_count == 2, "Empty content chunk wasn't skipped"
-
-
-@pytest.mark.asyncio
-async def test_integration_pipeline():
-    """Tests integration with complete pipeline.
-
-    Tests the service's behavior when integrated into a full pipeline with
-    input and output storage.
-
-    The test verifies:
-        - Frame flow through pipeline
-        - Correct frame sequence
-        - Input frame preservation
-        - Output frame generation
-        - Pipeline completion
-    """
-    with patch("nvidia_pipecat.services.nvidia_llm.ChatNVIDIA") as MockChatNVIDIA:
-        # Setup the mock ChatNVIDIA
-        mock_client = MagicMock()
-        MockChatNVIDIA.return_value = mock_client
-
-        # Setup mock astream to return chunks
-        chunks = [MockMessageChunk("Hello"), MockMessageChunk(" world!")]
-        mock_client.astream.return_value = MockAsyncIterator(chunks)
-
-        # Create service, storage, and pipeline
-        service = NvidiaLLMService(api_key="test_api_key")
-        input_storage = FrameStorage()  # Stores the input frame
-        output_storage = FrameStorage()  # Stores the output frames
-        pipeline = Pipeline([input_storage, service, output_storage])
-
-        # Create a messages frame
-        messages = [{"role": "user", "content": "Tell me something"}]
-        frame = LLMMessagesFrame(messages)
-
-        # Run the pipeline
-        async def test_routine(task):
-            await task.queue_frame(frame)
-
-            # Wait for specific frames to arrive in the output storage
-            await output_storage.wait_for_frame(ignore_ids(LLMFullResponseStartFrame()))
-            await output_storage.wait_for_frame(ignore_ids(TextFrame("Hello")))
-            await output_storage.wait_for_frame(ignore_ids(TextFrame(" world!")))
-            await output_storage.wait_for_frame(ignore_ids(LLMFullResponseEndFrame()))
-
-        await run_interactive_test(pipeline, test_coroutine=test_routine)
-
-        # Verify input frame in input storage (should have StartFrame, LLMMessagesFrame, EndFrame)
-        llm_messages_frame_found = False
-        for entry in input_storage.history:
-            if isinstance(entry.frame, LLMMessagesFrame):
-                llm_messages_frame_found = True
-                assert entry.frame.messages[0]["role"] == "user"
-                assert entry.frame.messages[0]["content"] == "Tell me something"
-        assert llm_messages_frame_found, "LLMMessagesFrame not found in input_storage"
-
-        # Verify output frames in output storage
-        full_response_start_found = False
-        text_frames_found = 0
-        full_response_end_found = False
-
-        for entry in output_storage.history:
-            frame = entry.frame
-            if isinstance(frame, LLMFullResponseStartFrame):
-                full_response_start_found = True
-            elif isinstance(frame, TextFrame):
-                if frame.text in ["Hello", " world!"]:
-                    text_frames_found += 1
-            elif isinstance(frame, LLMFullResponseEndFrame):
-                full_response_end_found = True
-
-        assert full_response_start_found, "LLMFullResponseStartFrame not found"
-        assert text_frames_found == 2, f"Expected 2 text frames, found {text_frames_found}"
-        assert full_response_end_found, "LLMFullResponseEndFrame not found"
+        # Verify that stream was not called (processing skipped)
+        mock_stream.assert_not_called()

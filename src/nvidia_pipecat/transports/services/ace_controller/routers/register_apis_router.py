@@ -47,8 +47,9 @@ async def add_stream(request: StreamRequest):
     """
     rtsp_url = request.event.camera_url
     stream_id = request.event.camera_id
+    logger.info(f"Received request to add stream ID {stream_id} with RTSP URL {rtsp_url}")
     await ACEPipelineRunner.get_instance().add_pipeline(stream_id, rtsp_url)
-    logger.info(f"Stream ID {stream_id} added")
+    logger.info(f"Successfully added stream ID {stream_id}")
     return {"message": f"Stream ID {stream_id} added"}
 
 
@@ -69,5 +70,7 @@ async def remove_stream(request: StreamRequest):
         dict: A dictionary with a message indicating the successful removal of the stream ID.
     """
     stream_id = request.event.camera_id
+    logger.info(f"Received request to remove stream ID {stream_id}")
     await ACEPipelineRunner.get_instance().remove_pipeline(stream_id)
+    logger.info(f"Successfully removed stream ID {stream_id}")
     return {"message": f"Stream ID {stream_id} removed"}

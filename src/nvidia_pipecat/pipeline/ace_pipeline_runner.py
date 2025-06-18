@@ -4,6 +4,7 @@
 """Pipeline runner for ACE."""
 
 import asyncio
+import gc
 from dataclasses import dataclass
 
 from fastapi import WebSocket
@@ -12,8 +13,6 @@ from pipecat.pipeline.task import PipelineTask
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from starlette.websockets import WebSocketState
-
-from nvidia_pipecat.transports.network.ace_fastapi_websocket import ACEInputTransport, ACEOutputTransport
 
 
 @dataclass
@@ -68,6 +67,20 @@ class ACEPipelineRunner:
         ACEPipelineRunner.__instance = self
 
     @staticmethod
+    def create_instance(pipeline_callback: callable, enable_rtsp: bool = False):
+        """Create an instance of the ACEPipelineRunner.
+
+        Args:
+            pipeline_callback: Callback function for pipeline creation
+            enable_rtsp: Boolean flag indicating if RTSP is enabled
+        """
+        if ACEPipelineRunner.__instance is not None:
+            return ACEPipelineRunner.__instance
+        else:
+            ACEPipelineRunner.__instance = ACEPipelineRunner(pipeline_callback, enable_rtsp)
+            return ACEPipelineRunner.__instance
+
+    @staticmethod
     def get_instance():
         """Get the singleton instance of the ACEPipelineRunner.
 
@@ -88,6 +101,7 @@ class ACEPipelineRunner:
             stream_id: Unique identifier for the pipeline stream
             rtsp_url: RTSP URL string for video/audio streaming
         """
+        logger.debug(f"Found {len(self._pipelines)} active pipelines with stream IDs: {self._pipelines.keys()}")
         with logger.contextualize(stream_id=stream_id):
             if stream_id in self._pipelines:
                 raise ValueError(f"Pipeline for Stream ID {stream_id} already exists")
@@ -141,18 +155,30 @@ class ACEPipelineRunner:
                         await self._pipelines[stream_id].pipeline_task.stop_when_done()
                     except Exception as e:
                         logger.error(f"Error while removing Pipeline: {e}")
-                        await self._pipelines[stream_id].runner_task.cancel()
 
-                    try:
-                        if (
-                            self._pipelines[stream_id].websocket
-                            and self._pipelines[stream_id].websocket.client_state == WebSocketState.CONNECTED
-                        ):
-                            await self._pipelines[stream_id].websocket.close()
-                    except Exception as e:
-                        logger.error(f"Error while closing websocket: {e}")
-                del self._pipelines[stream_id]
+                    if self._pipelines[stream_id].runner_task and not self._pipelines[stream_id].runner_task.done():
+                        logger.info("Waiting for pipeline runner task to finish ...")
+                        await self._pipelines[stream_id].runner_task
                 logger.info(f"Pipeline for Stream ID {stream_id} removed")
+
+    async def _cleanup_pipeline(self, stream_id: str):
+        """Cleanup a pipeline.
+
+        Args:
+            stream_id: Unique identifier for the pipeline stream
+        """
+        try:
+            if (
+                stream_id in self._pipelines
+                and self._pipelines[stream_id].websocket
+                and self._pipelines[stream_id].websocket.client_state == WebSocketState.CONNECTED
+            ):
+                await self._pipelines[stream_id].websocket.close()
+        except Exception as e:
+            logger.error(f"Error while closing websocket: {e}")
+        del self._pipelines[stream_id]
+        gc.collect()
+        logger.info(f"Pipeline for Stream ID {stream_id} deleted")
 
     async def _run_pipeline(self, stream_id: str):
         """Run a pipeline in background.
@@ -164,6 +190,9 @@ class ACEPipelineRunner:
             self._pipelines[stream_id].pipeline_task = await self._pipelines_callback(self._pipelines[stream_id])
             self._pipelines[stream_id].pipeline_task.set_event_loop(asyncio.get_event_loop())
             self._pipelines[stream_id].runner_task = asyncio.create_task(self._pipelines[stream_id].pipeline_task.run())
+            self._pipelines[stream_id].runner_task.add_done_callback(
+                lambda _: asyncio.create_task(self._cleanup_pipeline(stream_id))
+            )
             logger.info(f"Pipeline started successfully for stream {stream_id}")
         except Exception as e:
             logger.error(f"Error while creating pipeline task: {e}")
@@ -179,13 +208,13 @@ class ACEPipelineRunner:
         self._pipelines[stream_id].websocket = websocket
         pipeline = self._pipelines[stream_id].pipeline_task._pipeline
         for component in pipeline._processors:
-            if isinstance(component, ACEInputTransport | ACEOutputTransport):
-                await component.set_websocket(websocket)
-            elif isinstance(component, BaseInputTransport | BaseOutputTransport) and not hasattr(
-                component, "set_websocket"
-            ):
-                raise ValueError(f"Component {component.__class__.__name__} doesn't support updating websocket.")
-        logger.info(f"Websocket for Stream ID {stream_id} updated")
+            if isinstance(component, BaseInputTransport | BaseOutputTransport):
+                if hasattr(component._transport, "update_websocket"):
+                    await component._transport.update_websocket(websocket)
+                    logger.info(f"Websocket for Stream ID {stream_id} updated")
+                    return
+                else:
+                    raise ValueError(f"Component {component.__class__.__name__} doesn't support updating websocket.")
 
     async def _wait_for_websocket_close(self, stream_id: str):
         """Wait for the websocket to close. This is used to keep connection alive.

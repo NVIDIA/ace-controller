@@ -13,13 +13,24 @@ by incorporating knowledge from external documents. Features include:
 
 import json
 
-import aiohttp
+import httpx
 from loguru import logger
 from openai.types.chat import ChatCompletionMessageParam
-from pipecat.frames.frames import ErrorFrame, Frame, TextFrame
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
+    ErrorFrame,
+    Frame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMMessagesFrame,
+    StartInterruptionFrame,
+    TextFrame,
+    VisionImageRawFrame,
+)
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext, OpenAILLMContextFrame
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.openai import OpenAILLMService
+from pipecat.services.openai.llm import OpenAILLMService
 
 from nvidia_pipecat.frames.nvidia_rag import NvidiaRAGCitation, NvidiaRAGCitationsFrame, NvidiaRAGSettingsFrame
 
@@ -44,7 +55,7 @@ class NvidiaRAGService(OpenAILLMService):
         suffix_prompt: Text appended to last user message.
     """
 
-    _shared_session: aiohttp.ClientSession | None = None
+    _shared_session: httpx.AsyncClient | None = None
 
     def __init__(
         self,
@@ -59,7 +70,7 @@ class NvidiaRAGService(OpenAILLMService):
         reranker_top_k: int = 4,
         enable_citations: bool = True,
         suffix_prompt: str | None = None,
-        session: aiohttp.ClientSession | None = None,
+        session: httpx.AsyncClient | None = None,
         **kwargs,
     ):
         """Initialize the NVIDIA RAG service.
@@ -76,7 +87,7 @@ class NvidiaRAGService(OpenAILLMService):
             reranker_top_k: Number of chunks to rerank.
             enable_citations: Whether to return citations.
             suffix_prompt: Text appended to last user message.
-            session: Optional aiohttp.ClientSession. Creates new if None.
+            session: Optional httpx.AsyncClient. Creates new if None.
             **kwargs: Additional arguments passed to OpenAILLMService.
         """
         super().__init__(api_key="", **kwargs)
@@ -94,33 +105,54 @@ class NvidiaRAGService(OpenAILLMService):
         self.enable_citations = enable_citations
         self.suffix_prompt = suffix_prompt
         self._external_client_session = None
+        self._current_task = None
 
         if session is not None:
             self._external_client_session = session
 
     @property
-    def shared_session(self) -> aiohttp.ClientSession:
+    def shared_session(self) -> httpx.AsyncClient:
         """Get the shared HTTP client session.
 
         Returns:
-            aiohttp.ClientSession: The shared session for making HTTP requests.
+            httpx.AsyncClient: The shared session for making HTTP requests.
             Creates a new session if none exists and no external session was provided.
         """
         if self._external_client_session is not None:
             return self._external_client_session
 
         if NvidiaRAGService._shared_session is None:
-            NvidiaRAGService._shared_session = aiohttp.ClientSession()
+            NvidiaRAGService._shared_session = httpx.AsyncClient()
         return NvidiaRAGService._shared_session
 
     @shared_session.setter
-    def shared_session(self, shared_session: aiohttp.ClientSession):
+    def shared_session(self, shared_session: httpx.AsyncClient):
         """Set the shared HTTP client session.
 
         Args:
-            shared_session: The aiohttp ClientSession to use for all instances.
+            shared_session: The httpx.AsyncClient to use for all instances.
         """
         NvidiaRAGService._shared_session = shared_session
+
+    async def stop(self, frame: EndFrame):
+        """Stop the NVIDIA RAG service and cleanup resources.
+
+        Args:
+            frame: The EndFrame that triggered the stop.
+        """
+        await super().stop(frame)
+        if self._current_task:
+            await self.cancel_task(self._current_task)
+
+    async def cancel(self, frame: CancelFrame):
+        """Cancel the NVIDIA RAG service and cleanup resources.
+
+        Args:
+            frame: The CancelFrame that triggered the cancellation.
+        """
+        await super().cancel(frame)
+        if self._current_task:
+            await self.cancel_task(self._current_task)
 
     async def cleanup(self):
         """Clean up resources used by the RAG service.
@@ -133,8 +165,12 @@ class NvidiaRAGService(OpenAILLMService):
     async def _close_client_session(self):
         """Close the Client Session if it exists."""
         if NvidiaRAGService._shared_session:
-            await NvidiaRAGService._shared_session.close()
+            await NvidiaRAGService._shared_session.aclose()
             NvidiaRAGService._shared_session = None
+
+    async def _get_rag_response(self, request_json: dict):
+        resp = await self.shared_session.post(f"{self.rag_server_url}/generate", json=request_json)
+        return resp
 
     async def _process_context(self, context: OpenAILLMContext):
         """Processes LLM context through RAG pipeline.
@@ -184,25 +220,14 @@ class NvidiaRAGService(OpenAILLMService):
             await self.start_ttfb_metrics()
 
             full_response = ""
-            async with self.shared_session.post(f"{self.rag_server_url}/generate", json=request_json) as resp:
-                chunk = ""
-                async for current_chunk, _ in resp.content.iter_chunks():
-                    if not current_chunk:
-                        continue
-
+            resp = await self._get_rag_response(request_json)
+            try:
+                async for chunk in resp.aiter_lines():
                     await self.stop_ttfb_metrics()
 
                     citations = []
                     try:
-                        current_chunk = current_chunk.decode("utf-8")
-                        current_chunk = current_chunk.strip("\n")
-
-                        # When citations are returned in the response, the chunks are getting truncated.
-                        # Hence, aggregating them below.
-                        if current_chunk.startswith("data: "):
-                            chunk = current_chunk
-                        else:
-                            chunk += current_chunk
+                        chunk = chunk.strip("\n")
 
                         try:
                             if len(chunk) > 6:
@@ -225,8 +250,6 @@ class NvidiaRAGService(OpenAILLMService):
                                 message = ""
 
                         except Exception as e:
-                            # If json parsing of chunk is getting failed, it means we still don't have the final
-                            # aggregated version of the chunk from RAG or erroneous chunk is received from RAG
                             logger.debug(f"Parsing RAG response chunk failed. Error: {e}")
                             message = ""
                         if not message and not citations:
@@ -244,6 +267,8 @@ class NvidiaRAGService(OpenAILLMService):
                             await self.push_frame(TextFrame(message))
                     except Exception as e:
                         await self.push_error(ErrorFrame("Internal error in RAG stream: " + str(e)))
+            finally:
+                await resp.aclose()
 
             logger.debug(f"Full RAG response: {full_response}")
 
@@ -283,6 +308,14 @@ class NvidiaRAGService(OpenAILLMService):
                 case _:
                     logger.warning(f"Unknown setting for NvidiaRAG service: {setting}")
 
+    async def _process_context_and_frames(self, context: OpenAILLMContext):
+        """Process context and handle start/end frames with metrics."""
+        await self.push_frame(LLMFullResponseStartFrame())
+        await self.start_processing_metrics()
+        await self._process_context(context)
+        await self.stop_processing_metrics()
+        await self.push_frame(LLMFullResponseEndFrame())
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Processes pipeline frames.
 
@@ -292,7 +325,28 @@ class NvidiaRAGService(OpenAILLMService):
             frame: Input frame to process.
             direction: Frame processing direction.
         """
+        context = None
         if isinstance(frame, NvidiaRAGSettingsFrame):
             await self._update_settings(frame.settings)
+        if isinstance(frame, OpenAILLMContextFrame):
+            context: OpenAILLMContext = frame.context
+        elif isinstance(frame, LLMMessagesFrame):
+            context = OpenAILLMContext.from_messages(frame.messages)
+        elif isinstance(frame, VisionImageRawFrame):
+            context = OpenAILLMContext()
+            context.add_image_frame_message(format=frame.format, size=frame.size, image=frame.image, text=frame.text)
+        elif isinstance(frame, StartInterruptionFrame):
+            if self._current_task is not None:
+                await self.cancel_task(self._current_task)
+            await self._start_interruption()
+            await self.stop_all_metrics()
+            await self.push_frame(frame)
+        else:
+            await super().process_frame(frame, direction)
 
-        await super().process_frame(frame, direction)
+        if context:
+            new_task = self.create_task(self._process_context_and_frames(context))
+            if self._current_task is not None:
+                await self.cancel_task(self._current_task)
+            self._current_task = new_task
+            self._current_task.add_done_callback(lambda _: setattr(self, "_current_task", None))

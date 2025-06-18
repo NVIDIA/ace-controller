@@ -55,8 +55,11 @@ async def test_user_transcript_synchronization_processor():
     interim_transcript_frames = [
         InterimTranscriptionFrame("Hi", user_id, time_now_iso8601()),
         InterimTranscriptionFrame("there!", user_id, time_now_iso8601()),
+        InterimTranscriptionFrame("How are", user_id, time_now_iso8601()),
+        InterimTranscriptionFrame("you?", user_id, time_now_iso8601()),
     ]
-    finale_transcript_frame = TranscriptionFrame("Hi there!", user_id, time_now_iso8601())
+    finale_transcript_frame1 = TranscriptionFrame("Hi there!", user_id, time_now_iso8601())
+    finale_transcript_frame2 = TranscriptionFrame("How are you?", user_id, time_now_iso8601())
 
     frames_to_send = [
         UserStartedSpeakingFrame(),
@@ -64,37 +67,47 @@ async def test_user_transcript_synchronization_processor():
         interim_transcript_frames[1],
         SleepFrame(0.1),
         UserStoppedSpeakingFrame(),
-        finale_transcript_frame,
+        finale_transcript_frame1,
         SleepFrame(0.1),
         UserStartedSpeakingFrame(),
         interim_transcript_frames[0],
         interim_transcript_frames[1],
-        finale_transcript_frame,
+        finale_transcript_frame1,
+        interim_transcript_frames[2],
+        interim_transcript_frames[3],
+        finale_transcript_frame2,
         SleepFrame(0.1),
         UserStoppedSpeakingFrame(),
     ]
 
     expected_down_frames = [
         ignore_ids(UserStartedSpeakingFrame()),
-        ignore_ids(interim_transcript_frames[0]),
+        ignore_ids(UserUpdatedSpeakingTranscriptFrame("user started speaking")),
         ignore_ids(UserUpdatedSpeakingTranscriptFrame("Hi")),
-        ignore_ids(interim_transcript_frames[1]),
         ignore_ids(UserUpdatedSpeakingTranscriptFrame("there!")),
+        ignore_ids(interim_transcript_frames[0]),
+        ignore_ids(interim_transcript_frames[1]),
         ignore_ids(UserStoppedSpeakingFrame()),
-        ignore_ids(finale_transcript_frame),
         ignore_ids(UserStoppedSpeakingTranscriptFrame("Hi there!")),
+        ignore_ids(finale_transcript_frame1),
         ignore_ids(UserStartedSpeakingFrame()),
-        ignore_ids(interim_transcript_frames[0]),
+        ignore_ids(UserUpdatedSpeakingTranscriptFrame("user started speaking")),
         ignore_ids(UserUpdatedSpeakingTranscriptFrame("Hi")),
-        ignore_ids(interim_transcript_frames[1]),
         ignore_ids(UserUpdatedSpeakingTranscriptFrame("there!")),
-        ignore_ids(finale_transcript_frame),
+        ignore_ids(UserUpdatedSpeakingTranscriptFrame("How are")),
+        ignore_ids(UserUpdatedSpeakingTranscriptFrame("you?")),
+        ignore_ids(interim_transcript_frames[0]),
+        ignore_ids(interim_transcript_frames[1]),
+        ignore_ids(finale_transcript_frame1),
+        ignore_ids(interim_transcript_frames[2]),
+        ignore_ids(interim_transcript_frames[3]),
+        ignore_ids(finale_transcript_frame2),
         ignore_ids(UserStoppedSpeakingFrame()),
-        ignore_ids(UserStoppedSpeakingTranscriptFrame("Hi there!")),
+        ignore_ids(UserStoppedSpeakingTranscriptFrame("Hi there! How are you?")),
     ]
 
     await run_test(
-        UserTranscriptSynchronization(),
+        UserTranscriptSynchronization("user started speaking"),
         frames_to_send=frames_to_send,
         expected_down_frames=expected_down_frames,
     )
@@ -226,12 +239,12 @@ async def test_bot_transcript_synchronization_processor_with_elevenlabs_tts():
         ignore_ids(BotStartedSpeakingFrame()),
         ignore_ids(BotUpdatedSpeakingTranscriptFrame("Welcome")),
         ignore_ids(BotUpdatedSpeakingTranscriptFrame("Welcome user!")),
-        ignore_ids(tts_text_frames[1]),
         ignore_ids(BotUpdatedSpeakingTranscriptFrame("Welcome user! How")),
-        ignore_ids(tts_text_frames[2]),
         ignore_ids(BotUpdatedSpeakingTranscriptFrame("Welcome user! How are")),
-        ignore_ids(tts_text_frames[3]),
         ignore_ids(BotUpdatedSpeakingTranscriptFrame("Welcome user! How are you?")),
+        ignore_ids(tts_text_frames[1]),
+        ignore_ids(tts_text_frames[2]),
+        ignore_ids(tts_text_frames[3]),
         ignore_ids(tts_text_frames[4]),
         ignore_ids(TTSStoppedFrame()),
         ignore_ids(BotStoppedSpeakingFrame()),

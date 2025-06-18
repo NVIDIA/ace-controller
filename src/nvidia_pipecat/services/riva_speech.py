@@ -36,7 +36,8 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
-from pipecat.services.ai_services import STTService, TTSService
+from pipecat.services.stt_service import STTService
+from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from riva.client.proto.riva_audio_pb2 import AudioEncoding
@@ -62,11 +63,11 @@ class RivaTTSService(TTSService):
         sample_rate: int = 16000,
         function_id: str = "0149dedb-2be8-4195-b9a0-e57e0e14f972",
         language: Language | None = Language.EN_US,
-        quality: int | None = 20,
+        zero_shot_quality: int | None = 20,
         model: str = "fastpitch-hifigan-tts",
         custom_dictionary: dict | None = None,
         encoding: AudioEncoding = AudioEncoding.LINEAR_PCM,
-        audio_prompt_file: str | None = None,
+        zero_shot_audio_prompt_file: str | None = None,
         audio_prompt_encoding: AudioEncoding = AudioEncoding.LINEAR_PCM,
         use_ssl: bool = False,
         **kwargs,
@@ -81,11 +82,11 @@ class RivaTTSService(TTSService):
             function_id (str, optional): Function identifier for the service.
                 Defaults to "0149dedb-2be8-4195-b9a0-e57e0e14f972".
             language (Language | None, optional): Language for synthesis. Defaults to Language.EN_US.
-            quality (int | None, optional): Quality level for synthesis. Defaults to 20.
+            zero_shot_quality (int | None, optional): Quality level for synthesis. Defaults to 20.
             model (str, optional): Model name for synthesis. Defaults to "fastpitch-hifigan-tts".
             custom_dictionary (dict | None, optional): Custom pronunciation dictionary. Defaults to None.
             encoding (AudioEncoding, optional): Audio encoding format. Defaults to AudioEncoding.LINEAR_PCM.
-            audio_prompt_file (str | None, optional): Path to audio prompt file. Defaults to None.
+            zero_shot_audio_prompt_file (str | None, optional): Path to audio prompt file. Defaults to None.
             audio_prompt_encoding (AudioEncoding, optional): Encoding of audio prompt.
                 Defaults to AudioEncoding.LINEAR_PCM.
             use_ssl (bool, optional): Whether to use SSL for connection. Defaults to False.
@@ -111,12 +112,12 @@ class RivaTTSService(TTSService):
         self._voice_id = voice_id
         self._sample_rate = sample_rate
         self._language_code = language
-        self._quality = quality
+        self._zero_shot_quality = zero_shot_quality
         self.set_model_name(model)
         self.set_voice(voice_id)
         self._custom_dictionary = custom_dictionary
         self._encoding = encoding
-        self._audio_prompt_file = audio_prompt_file
+        self._zero_shot_audio_prompt_file = zero_shot_audio_prompt_file
         self._audio_prompt_encoding = audio_prompt_encoding
 
         metadata = [
@@ -153,17 +154,27 @@ class RivaTTSService(TTSService):
 
     async def _push_tts_frames(self, text: str):
         """Override base class method to push text frames immediately."""
+        # Remove leading newlines only
+        text = text.lstrip("\n")
+
+        # Don't send only whitespace. This causes problems for some TTS models. But also don't
+        # strip all whitespace, as whitespace can influence prosody.
         if not text.strip():
             return
 
+        # This is just a flag that indicates if we sent something to the TTS
+        # service. It will be cleared if we sent text because of a TTSSpeakFrame
+        # or when we received an LLMFullResponseEndFrame
         self._processing_text = True
 
         await self.start_processing_metrics()
-        if self._text_filter:
-            self._text_filter.reset_interruption()
-            text = self._text_filter.filter(text)
+        # Process all filter.
+        for filter in self._text_filters:
+            filter.reset_interruption()
+            text = filter.filter(text)
 
-        await self.process_generator(self.run_tts(text))
+        if text:
+            await self.process_generator(self.run_tts(text))
         await self.stop_processing_metrics()
 
     @traced(attachment_strategy=AttachmentStrategy.NONE, name="tts")
@@ -175,9 +186,9 @@ class RivaTTSService(TTSService):
             self._voice_id,
             self._language_code,
             sample_rate_hz=self._sample_rate,
-            audio_prompt_file=self._audio_prompt_file,
+            zero_shot_audio_prompt_file=self._zero_shot_audio_prompt_file,
             audio_prompt_encoding=self._audio_prompt_encoding,
-            quality=self._quality,
+            zero_shot_quality=self._zero_shot_quality,
             custom_dictionary=self._custom_dictionary,
             encoding=self._encoding,
         )
@@ -476,7 +487,6 @@ class RivaASRService(STTService):
             if result and not result.alternatives:
                 continue
             transcript = result.alternatives[0].transcript
-            logger.debug(f"Transcript received at Riva ASR: [{transcript}]")
             if transcript and len(transcript) > 0:
                 await self.stop_ttfb_metrics()
                 if result.is_final:
@@ -497,7 +507,7 @@ class RivaASRService(STTService):
                         or (self.last_transcript_frame.stability != 1.0)
                         or (self.last_transcript_frame.text.rstrip() != transcript.rstrip())
                     ):
-                        logger.debug(f"Interim User transcript: [{transcript}]")
+                        logger.debug(f"Interim user transcript: [{transcript}]")
                         frame = RivaInterimTranscriptionFrame(
                             transcript, "", time_now_iso8601(), None, stability=result.stability
                         )
@@ -515,7 +525,7 @@ class RivaASRService(STTService):
             or (self.last_transcript_frame.stability == 1.0)
             or (self.last_transcript_frame.text.rstrip() != partial_transcript.rstrip())
         ):
-            logger.debug(f"Partial User transcript: [{partial_transcript}]")
+            logger.debug(f"Partial user transcript: [{partial_transcript}]")
             frame = RivaInterimTranscriptionFrame(partial_transcript, "", time_now_iso8601(), None, stability=0.1)
             await self.push_frame(frame)
             self.last_transcript_frame = frame

@@ -29,6 +29,7 @@ async def websocket_endpoint(
         stream_id (str): The ID of the stream.
     """
     # Accept the WebSocket connection.
+    logger.info(f"Accepting WebSocket connection for stream ID {stream_id}")
     await websocket.accept()
     try:
         # Update the pipeline with the websocket connection.

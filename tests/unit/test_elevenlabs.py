@@ -32,6 +32,7 @@ class MockWebSocket:
         close_rcvd: Close frame received flag.
         close_rcvd_then_sent: Close frame received and sent flag.
         close_sent: Close frame sent flag.
+        closed: Whether the WebSocket is closed.
     """
 
     def __init__(self, messages_to_return):
@@ -46,6 +47,7 @@ class MockWebSocket:
         self.close_rcvd = None
         self.close_rcvd_then_sent = None
         self.close_sent = None
+        self.closed = False
 
     async def send(self, message: str) -> None:
         """Sends a message through the mock socket.
@@ -70,6 +72,7 @@ class MockWebSocket:
             bool: Always True for testing.
         """
         self.state = State.CLOSED
+        self.closed = True
         return True
 
     async def __aiter__(self):
@@ -158,7 +161,7 @@ async def test_elevenlabs_tts_service_with_end_of_speech():
         # mock = AsyncMock()
         # mock.return_value = mock_websocket
 
-        with patch("pipecat.services.elevenlabs.websockets.connect", new=AsyncMock()) as mock:
+        with patch("pipecat.services.elevenlabs.tts.websockets.connect", new=AsyncMock()) as mock:
             mock.return_value = mock_websocket
             tts_service = ElevenLabsTTSServiceWithEndOfSpeech(
                 api_key="test_api_key", voice_id="test_voice_id", sample_rate=16000, channels=1

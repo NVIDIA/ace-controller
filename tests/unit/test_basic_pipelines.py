@@ -4,7 +4,6 @@
 """Basic functionality tests for pipecat pipelines."""
 
 import asyncio
-from unittest.mock import ANY
 
 import pytest
 from loguru import logger
@@ -42,7 +41,7 @@ async def test_pipeline_with_stream_id():
     frames_to_send = [TextFrame("Hello, "), TextFrame("world.")]
     start_metadata = {"stream_id": "1234"}
 
-    expected_start_frame = ignore_ids(StartFrame(clock=ANY, task_manager=ANY, observer=ANY))
+    expected_start_frame = ignore_ids(StartFrame())
     expected_start_frame.metadata = start_metadata
     expected_down_frames = [expected_start_frame, ignore_ids(TextFrame("Hello, world."))]
 

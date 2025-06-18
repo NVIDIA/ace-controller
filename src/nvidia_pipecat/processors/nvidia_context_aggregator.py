@@ -44,7 +44,12 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
-from pipecat.processors.aggregators.llm_response import LLMAssistantContextAggregator, LLMUserContextAggregator
+from pipecat.processors.aggregators.llm_response import (
+    LLMAssistantAggregatorParams,
+    LLMAssistantContextAggregator,
+    LLMUserAggregatorParams,
+    LLMUserContextAggregator,
+)
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext, OpenAILLMContextFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -313,13 +318,13 @@ class NvidiaTTSResponseCacher(FrameProcessor):
         - StartInterruptionFrame: Clears cache
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the NvidiaTTSResponseCacher."""
         super().__init__()
-        self._cache = []
-        self.user_stopped_speaking = True
+        self._cache: list[Frame] = []
+        self.user_stopped_speaking: bool = True
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Processes frame for TTS response caching and timing control.
 
         - Caches TTS responses while user is speaking
@@ -351,7 +356,7 @@ class NvidiaTTSResponseCacher(FrameProcessor):
             if self.user_stopped_speaking:
                 await self.push_frame(frame, direction)
             else:
-                self._cache = []  # Clear existing cache before new response
+                self._cache.clear()  # Clear existing cache before new response
                 self._cache.append(frame)
 
         # Handle TTS frames - cache or forward based on user speaking state
@@ -373,17 +378,17 @@ class NvidiaTTSResponseCacher(FrameProcessor):
             # TODO: This only works if we have a single user in the system.
             # it also does not work if other "events" should trigger the cache release
             # (e.g. new frames by new processors).
-            self._cache = []
+            self._cache.clear()
             self.user_stopped_speaking = True
             await self.push_frame(frame, direction)
 
         # Handle user stop speaking - release cached responses
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self.user_stopped_speaking = True
-            if len(self._cache) > 0:
+            if self._cache:
                 for cached_frame in self._cache:
                     await self.push_frame(cached_frame)
-            self._cache = []
+            self._cache.clear()
             await self.push_frame(frame, direction)
 
         # Handle user start speaking - update state
@@ -462,11 +467,11 @@ def create_nvidia_context_aggregator(
         >>> assistant_aggregator = aggregators.assistant()
     """
     # Create user aggregator with specified settings
+    user_params = LLMUserAggregatorParams(aggregation_timeout=0.01)
     user = NvidiaUserContextAggregator(
-        send_interims=send_interims, context=context, aggregation_timeout=0.01, chat_history_limit=chat_history_limit
+        send_interims=send_interims, context=context, params=user_params, chat_history_limit=chat_history_limit
     )
     # Create assistant aggregator sharing context with user
-    assistant = NvidiaAssistantContextAggregator(
-        context=user.context, expect_stripped_words=assistant_expect_stripped_words
-    )
+    assistant_params = LLMAssistantAggregatorParams(expect_stripped_words=assistant_expect_stripped_words)
+    assistant = NvidiaAssistantContextAggregator(context=user.context, params=assistant_params)
     return NvidiaContextAggregatorPair(_user=user, _assistant=assistant)

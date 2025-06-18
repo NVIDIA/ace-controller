@@ -28,6 +28,7 @@ from nvidia_ace.status_pb2 import Status
 from nvidia_animation_graph.animgraph_pb2_grpc import AnimationDataServiceStub
 from nvidia_animation_graph.messages_pb2 import AnimationDataStream, AnimationDataStreamHeader, AnimationIds
 from pipecat.frames.frames import (
+    BotSpeakingFrame,
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     EndFrame,
@@ -1078,7 +1079,7 @@ class AnimationGraphService(BaseActionService):
         animation_graph_grpc_target: str,
         message_broker_config: MessageBrokerConfig,
         config: AnimationGraphConfiguration,
-        should_check_fps: bool = True,
+        check_data_starvation: bool = True,
     ):
         """Initialize the animation graph service.
 
@@ -1087,8 +1088,9 @@ class AnimationGraphService(BaseActionService):
             animation_graph_grpc_target: The gRPC target for the animation graph service.
             message_broker_config: The message broker configuration.
             config: The animation graph configuration.
-            should_check_fps: Whether to check the FPS of the received animation data to print a warning when
-                FPS is too low.
+            check_data_starvation: Whether to check for data starvation. If enabled this will print a warning as well
+                as close the stream to AnimGraph if the data is not received in time. This is useful to prevent leaving
+                the avatar in a bad state when e.g. the audio stream stopped too early (e.g. a TTS connectivity issue).
         """
         self.animation_graph_client: AnimationGraphClient | None = None
         self.animation_graph_rest_url = animation_graph_rest_url
@@ -1100,20 +1102,17 @@ class AnimationGraphService(BaseActionService):
         self.current_speaking_action_id: str | None = None
         self._bot_speaking: bool = False
 
-        # FPS monitoring variables
-        self._should_check_fps = should_check_fps
-        self._last_frame_time: float | None = None
-        self._frame_times: list[float] = []
-        self._low_fps_count: int = 0
-        self._fps_warning_threshold: int = 30  # FPS threshold for warnings
-        self._consecutive_low_fps_threshold: int = 5  # Number of consecutive frames below threshold to trigger warning
-        self._fps_window_size: int = 30  # Number of frames to average FPS over
+        # Data stream monitoring variables
+        self._check_data_starvation = check_data_starvation
+        self._data_stream_in_progress = False
+        self._data_stream_warning_sent = False
 
         self.animation_data_queue: asyncio.Queue[
             AnimationDataStreamStartedFrame | AnimationDataStreamRawFrame | AnimationDataStreamStoppedFrame
         ] = asyncio.Queue()
         self.stream_animation_data_task: asyncio.Task | None = None
         self.process_animation_events_task: asyncio.Task | None = None
+        self._bot_speaking_handler_task: asyncio.Task | None = None
         self.channel = grpc.aio.insecure_channel(self.animation_graph_grpc_target)
         self.stub = AnimationDataServiceStub(self.channel)
 
@@ -1151,6 +1150,7 @@ class AnimationGraphService(BaseActionService):
 
         self.stream_animation_data_task = self.create_task(self._stream_animation_data())
         self.process_animation_events_task = self.create_task(self._process_animation_events())
+        self._bot_speaking_handler_task = self.create_task(self._bot_speaking_handler())
 
         # Load animation databases from cache or create new ones
         for type_name, _supported_type in self.supported_animation_types.items():
@@ -1189,7 +1189,7 @@ class AnimationGraphService(BaseActionService):
             if not await self.get_client().stop_request_playback(self.current_speaking_action_id):
                 # This can often happen if the playback finished before the stop request was received
                 # so we don't want to it as an error, but just log it as a debug message
-                info_message = f"Animgraph: stopping playback for {self.current_speaking_action_id} failed"
+                info_message = f"Stopping playback for {self.current_speaking_action_id} failed (usually harmless)"
                 logger.debug(info_message)
                 # await self.push_frame(ErrorFrame(error_message))
         else:
@@ -1198,7 +1198,7 @@ class AnimationGraphService(BaseActionService):
         await self._bot_stopped_speaking()
         logger.debug("waiting for streaming task to finish")
         await self._stop_stream_animation_data_task()
-        logger.debug("creating new data streaming task wiht an empty queue")
+        logger.debug("creating new data streaming task with an empty queue")
         self.animation_data_queue = asyncio.Queue()
         self.stream_animation_data_task = self.create_task(self._stream_animation_data())
 
@@ -1245,18 +1245,37 @@ class AnimationGraphService(BaseActionService):
             await self.push_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
             self._bot_speaking = False
 
+    async def _bot_speaking_handler(self):
+        """This task sends out BotSpeakingFrames every 200ms to fulfill the protocol of the output transports.
+
+        We have no way of knowing when exactly audio chunks are being sent by the renderer to the client
+        so we simply send a BotSpeakingFrame every 200ms.
+        """
+        TIMEOUT = 0.2
+        while not self._cancelling:
+            await asyncio.sleep(TIMEOUT)
+            if self._bot_speaking:
+                await self.push_frame(BotSpeakingFrame())
+                await self.push_frame(BotSpeakingFrame(), FrameDirection.UPSTREAM)
+
     async def _stream_animation_data(self) -> None:
         stream: StreamUnaryCall[AnimationDataStream, Status] | None = None
+        DATA_STREAM_TIMEOUT = 0.3
         while not self._cancelling:
             try:
-                frame = await self.animation_data_queue.get()
+                if stream:
+                    frame = await asyncio.wait_for(self.animation_data_queue.get(), timeout=DATA_STREAM_TIMEOUT)
+                else:
+                    frame = await self.animation_data_queue.get()
+
                 new_message = None
+
                 if isinstance(frame, AnimationDataStreamStartedFrame):
                     await self.avatar_done_talking.wait()
                     stream = self.stub.PushAnimationDataStream(metadata=(("x-stream-id", self.stream_id),))
                     audio_header: AudioHeader = frame.audio_header
                     self.current_speaking_action_id = frame.action_id
-                    logger.debug(f"sending header with request_id={self.current_speaking_action_id}")
+                    logger.debug(f"Sending AnimationData header with request_id={self.current_speaking_action_id}")
                     new_message = AnimationDataStream(
                         animation_data_stream_header=AnimationDataStreamHeader(
                             animation_ids=AnimationIds(
@@ -1273,21 +1292,30 @@ class AnimationGraphService(BaseActionService):
                     await self._bot_started_speaking()
 
                 elif isinstance(frame, AnimationDataStreamRawFrame):
-                    current_time = time.time()
-                    await self._check_fps(current_time)
                     new_message = AnimationDataStream(
                         animation_data=frame.animation_data,
                     )
                 elif isinstance(frame, AnimationDataStreamStoppedFrame):
-                    self._reset_check_fps()
-                    logger.debug(f"animation stopped for request_id={self.current_speaking_action_id}")
+                    logger.debug(
+                        f"AnimationData stream stopped for request_id={self.current_speaking_action_id}. "
+                        "Does not affect playback."
+                    )
                     if stream and not stream.done():
                         await stream.done_writing()
                         stream = None
 
+                # Send new message only if we have an active stream
                 if new_message and stream and not stream.done():
-                    # logger.debug(f"data for request_id={self.current_speaking_action_id}")
                     await stream.write(new_message)
+
+                if await self._check_datastream_starvation(frame):
+                    await self._close_stream(stream)
+                    stream = None
+
+            except TimeoutError:
+                if await self._check_datastream_starvation(None):
+                    await self._close_stream(stream)
+                    stream = None
             except Exception as e:
                 logger.error(f"Exception: {e}")
 
@@ -1308,13 +1336,16 @@ class AnimationGraphService(BaseActionService):
         if self.stream_animation_data_task:
             await self.cancel_task(self.stream_animation_data_task, timeout=0.3)
             self.stream_animation_data_task = None
-            self._reset_check_fps()
+            self._data_stream_in_progress = False
 
     async def _stop_running_tasks(self) -> None:
         await self._stop_stream_animation_data_task()
         if self.process_animation_events_task:
             await self.cancel_task(self.process_animation_events_task, timeout=0.3)
             self.process_animation_events_task = None
+        if self._bot_speaking_handler_task:
+            await self.cancel_task(self._bot_speaking_handler_task, timeout=0.3)
+            self._bot_speaking_handler_task = None
 
     async def cleanup(self) -> None:
         """Clean up the service."""
@@ -1344,50 +1375,67 @@ class AnimationGraphService(BaseActionService):
                 db = AnimationDatabase(animation_config.clips)
                 cls.animation_databases[animation_name] = db
 
-    def _reset_check_fps(self) -> None:
-        self._frame_times = []
-        self._last_frame_time = None
-        self._low_fps_count = 0
+    async def _close_stream(self, stream: StreamUnaryCall[AnimationDataStream, Status]) -> None:
+        logger.debug(
+            f"Closing stream for request_id={self.current_speaking_action_id}"
+            " before StoppedFrame was received due to stream starvation."
+        )
+        self._data_stream_in_progress = False
+        if stream and not stream.done():
+            await stream.done_writing()
+            try:
+                await self.get_client().stop_request_playback(self.current_speaking_action_id)
+            except Exception as e:
+                logger.info(f"Could not stop request playback on timeout: {e}")
 
-    async def _check_fps(self, current_time: float) -> None:
-        """Check if FPS is below threshold and log warning if needed.
+    async def _check_datastream_starvation(
+        self,
+        frame: AnimationDataStreamStartedFrame | AnimationDataStreamRawFrame | AnimationDataStreamStoppedFrame | None,
+    ) -> bool:
+        if not self._check_data_starvation:
+            return False
 
-        Args:
-            current_time: Current timestamp in seconds
-        """
-        if not self._should_check_fps:
-            return
+        WARNING_TIMEOUT_S = 0.1  # Print warning if data is delayed by more than this
+        STARVATION_CLOSE_TIMEOUT_S = 1.0  # Indicate starvation if data is delayed by more than this
 
-        if self._last_frame_time is not None:
-            frame_time = current_time - self._last_frame_time
-            if frame_time > 0:
-                self._frame_times.append(frame_time)
+        if isinstance(frame, AnimationDataStreamStartedFrame):
+            self._data_until_playback_starves = time.monotonic()
+            self._audio_samples_per_second = frame.audio_header.samples_per_second
+            self._audio_bits_per_sample = frame.audio_header.bits_per_sample
+            self._audio_channel_count = frame.audio_header.channel_count
+            self._data_stream_in_progress = True
+            self._data_stream_warning_sent = False
 
-            # Keep only the last N frames for averaging
-            if len(self._frame_times) > self._fps_window_size:
-                self._frame_times.pop(0)
+        elif isinstance(frame, AnimationDataStreamStoppedFrame):
+            self._data_stream_in_progress = False
 
-            # Calculate average FPS over the window
-            if len(self._frame_times) > 0:
-                avg_frame_time = sum(self._frame_times) / len(self._frame_times)
-                current_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+        elif self._data_stream_in_progress and isinstance(frame, AnimationDataStreamRawFrame):
+            audio_buffer_size = len(frame.animation_data.audio.audio_buffer)
 
-                if current_fps < self._fps_warning_threshold:
-                    self._low_fps_count += 1
-                    if self._low_fps_count >= self._consecutive_low_fps_threshold:
-                        logger.warning(
-                            f"Low FPS detected: {current_fps:.0f} FPS (below {self._fps_warning_threshold} FPS) "
-                            f"for {self._low_fps_count} consecutive frames"
-                        )
+            audio_buffer_size_s = audio_buffer_size / (
+                self._audio_samples_per_second * self._audio_bits_per_sample / 8 * self._audio_channel_count
+            )
 
-                        await self.push_frame(
-                            ErrorFrame(
-                                f"Animgraph: Low FPS detected: {current_fps:.0f}"
-                                f"FPS (below {self._fps_warning_threshold} FPS)."
-                            )
-                        )
-                        self._low_fps_count = 0
-                else:
-                    self._low_fps_count = 0
+            self._data_until_playback_starves += audio_buffer_size_s
 
-        self._last_frame_time = current_time
+        if self._data_stream_in_progress:
+            now = time.monotonic()
+            if now > self._data_until_playback_starves + STARVATION_CLOSE_TIMEOUT_S:
+                logger.warning(
+                    f"Data stream starvation detected: data behind by {now - self._data_until_playback_starves}s"
+                )
+                await self.push_frame(
+                    ErrorFrame("AnimGraph: Data stream starvation detected. AnimGraph connection will be reset.")
+                )
+                return True
+
+            elif now > self._data_until_playback_starves + WARNING_TIMEOUT_S:
+                logger.info(f"Data stream data behind by {now - self._data_until_playback_starves}s")
+                if not self._data_stream_warning_sent:
+                    await self.push_frame(
+                        ErrorFrame(f"AnimGraph: Received data stream is behind by more than {WARNING_TIMEOUT_S}s")
+                    )
+                    self._data_stream_warning_sent = True
+                return False
+        else:
+            return False

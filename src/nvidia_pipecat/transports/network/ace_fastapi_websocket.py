@@ -21,7 +21,7 @@ import av.logging
 from av.audio.resampler import AudioResampler
 from loguru import logger
 from pipecat.frames.frames import (
-    BotStoppedSpeakingFrame,
+    AudioRawFrame,
     CancelFrame,
     EndFrame,
     FatalErrorFrame,
@@ -73,7 +73,6 @@ class ACETransportParams(TransportParams):
         rtsp_max_delay: Buffer delay in microseconds.
         audio_in_enabled: Enable audio input.
         camera_in_enabled: Enable camera input.
-        audio_out_chunk_size: Output chunk size in bytes.
         audio_out_enabled: Enable audio output.
         audio_out_sample_rate: Output sample rate in Hz.
         audio_in_encoding: Input audio encoding format.
@@ -81,6 +80,7 @@ class ACETransportParams(TransportParams):
         audio_out_bitrate: Output bitrate in bits/second.
         serializer: Frame serializer instance.
         session_timeout: WebSocket timeout in seconds.
+        burst_mode_duration: Initial duration for which the output audio data will be sent in burst mode in seconds.
     """
 
     rtsp_url: str = ""  # RTSP Input URL
@@ -88,7 +88,6 @@ class ACETransportParams(TransportParams):
     rtsp_max_delay: str = "500000"  # Increase buffer delay (in microseconds).
     audio_in_enabled: bool = True  # Enable/Disable audio input
     camera_in_enabled: bool = False  # Enable/Disable camera input
-    audio_out_chunk_size: int = 3200  # 100ms
     audio_out_enabled: bool = True  #  Enable/Disable audio output
     audio_out_sample_rate: int = 16000  # Sample rate of the audio output
     audio_in_encoding: AudioEncoding = AudioEncoding.PCM  # Encoding of the audio input
@@ -96,6 +95,118 @@ class ACETransportParams(TransportParams):
     audio_out_bitrate: int = 32000  # Bitrate of the audio output
     serializer: FrameSerializer = ProtobufFrameSerializer()  # Serializer for the audio output
     session_timeout: int | None = None  # Timeout for the websocket connection
+    burst_mode_duration: float = 0.4  # Initial duration for which the audio data will be sent in burst mode
+
+
+class FastAPIWebsocketClient:
+    """FastAPI WebSocket client implementation.
+
+    This class provides a client implementation for FastAPI WebSocket connections,
+    handling setup, message sending, and disconnection.
+    """
+
+    def __init__(self, websocket: WebSocket, is_binary: bool, callbacks: FastAPIWebsocketCallbacks):
+        """Initialize the FastAPIWebsocketClient.
+
+        Args:
+            websocket: The FastAPI WebSocket connection.
+            is_binary: Whether the Serializer is binary.
+            callbacks: The callbacks for the WebSocket client.
+        """
+        self._websocket = websocket
+        self._closing = False
+        self._is_binary = is_binary
+        self._callbacks = callbacks
+        self._leave_counter = 0
+
+    async def setup(self, _: StartFrame):
+        """Setup the WebSocket client.
+
+        Args:
+            _: The StartFrame.
+        """
+        self._leave_counter += 1
+
+    def receive(self) -> typing.AsyncIterator[bytes | str]:
+        """Receive messages from the WebSocket connection.
+
+        Returns:
+            typing.AsyncIterator[bytes | str]: An asynchronous iterator over the received messages.
+        """
+        return self._websocket.iter_bytes() if self._is_binary else self._websocket.iter_text()
+
+    async def send(self, data: str | bytes):
+        """Send a message through the WebSocket connection.
+
+        Args:
+            data: The message to send.
+        """
+        if self._can_send():
+            if self._is_binary:
+                await self._websocket.send_bytes(data)
+            else:
+                await self._websocket.send_text(data)
+
+    async def disconnect(self):
+        """Disconnect from the WebSocket connection.
+
+        This method will disconnect from the WebSocket connection and trigger the client disconnected event.
+        """
+        self._leave_counter -= 1
+        if self._leave_counter > 0:
+            return
+
+        if self.is_connected and not self.is_closing:
+            self._closing = True
+            await self._websocket.close()
+            await self.trigger_client_disconnected()
+
+    async def trigger_client_disconnected(self):
+        """Trigger the client disconnected event.
+
+        This method will trigger the client disconnected event.
+        """
+        await self._callbacks.on_client_disconnected(self._websocket)
+
+    async def trigger_client_connected(self):
+        """Trigger the client connected event.
+
+        This method will trigger the client connected event.
+        """
+        await self._callbacks.on_client_connected(self._websocket)
+
+    async def trigger_client_timout(self):
+        """Trigger the client timeout event.
+
+        This method will trigger the client timeout event.
+        """
+        await self._callbacks.on_session_timeout(self._websocket)
+
+    def _can_send(self):
+        """Check if the client can send messages.
+
+        Returns:
+            bool: True if the client can send messages, False otherwise.
+        """
+        return self.is_connected and not self.is_closing
+
+    @property
+    def is_connected(self) -> bool:
+        """Check if the client is connected.
+
+        Returns:
+            bool: True if the client is connected, False otherwise.
+        """
+        return self._websocket.client_state == WebSocketState.CONNECTED
+
+    @property
+    def is_closing(self) -> bool:
+        """Check if the client is closing.
+
+        Returns:
+            bool: True if the client is closing, False otherwise.
+        """
+        return self._closing
 
 
 class ACEInputTransport(BaseInputTransport):
@@ -110,31 +221,28 @@ class ACEInputTransport(BaseInputTransport):
 
     def __init__(
         self,
+        transport: BaseTransport,
+        client: FastAPIWebsocketClient,
         params: ACETransportParams,
-        callbacks: FastAPIWebsocketCallbacks,
-        websocket: WebSocket | None = None,
         **kwargs,
     ):
         """Initializes the input transport.
 
         Args:
             params: Transport configuration parameters.
-            callbacks: WebSocket event callbacks.
-            websocket: Optional WebSocket connection.
+            transport: Transport instance.
+            client: WebSocket client instance.
             **kwargs: Additional arguments for BaseInputTransport.
         """
         super().__init__(params, **kwargs)
-
-        self._websocket = websocket
+        self._transport = transport
+        self._client = client
         self._params = params
-        self._callbacks = callbacks
-
-        if self._params.rtsp_url != "":
-            self._resampler = AudioResampler(
-                layout="stereo" if self._params.audio_in_channels == 2 else "mono",
-                rate=self._sample_rate,
-                format="s16",
-            )
+        self._receive_task = None
+        self._monitor_websocket_task = None
+        self._start_frame = None
+        self._read_rtsp_task = None
+        self._process_rtsp_task = None
 
     async def start(self, frame: StartFrame) -> None:
         """Starts input transport processing.
@@ -144,15 +252,18 @@ class ACEInputTransport(BaseInputTransport):
         """
         await super().start(frame)
         await self._params.serializer.setup(frame)
-        self.vad_chunk_size = int(self._sample_rate * self._params.audio_in_channels * 2 * 0.032)
-        if self._params.rtsp_url != "":
-            await self._start_rtsp()
-        if self._websocket:
+        self.vad_chunk_size = int(self._sample_rate * self._params.audio_in_channels * 2 * 0.032)  # 32 ms
+        self._start_frame = frame
+        if self._client:
             await self._start_websocket()
-
-    async def _stop_tasks(self):
-        await self._stop_websocket_tasks()
-        await self._stop_rtsp_tasks()
+        if self._params.rtsp_url != "":
+            self._resampler = AudioResampler(
+                layout="stereo" if self._params.audio_in_channels == 2 else "mono",
+                rate=self._sample_rate,
+                format="s16",
+            )
+            await self._start_rtsp()
+        await self.set_transport_ready(frame)
 
     async def stop(self, frame: EndFrame):
         """Stop the input transport and cleanup resources.
@@ -161,9 +272,8 @@ class ACEInputTransport(BaseInputTransport):
             frame: The EndFrame that triggered the stop.
         """
         await super().stop(frame)
-        await self._stop_tasks()
-        if self._websocket and self._websocket.state == WebSocketState.CONNECTED:
-            self._websocket.close()
+        await self._stop_websocket_tasks()
+        await self._stop_rtsp_tasks()
 
     async def cancel(self, frame: CancelFrame):
         """Cancel the input transport and cleanup resources.
@@ -172,19 +282,26 @@ class ACEInputTransport(BaseInputTransport):
             frame: The CancelFrame that triggered the cancellation.
         """
         await super().cancel(frame)
-        await self._stop_tasks()
-        if self._websocket and self._websocket.state == WebSocketState.CONNECTED:
-            self._websocket.close()
+        await self._stop_websocket_tasks()
+        await self._stop_rtsp_tasks()
+
+    async def cleanup(self):
+        """Cleanup the input transport and resources.
+
+        This method will cleanup the input transport and resources.
+        """
+        await super().cleanup()
+        await self._transport.cleanup()
 
     ## Functions for WebSocket
 
-    async def set_websocket(self, websocket: WebSocket):
+    async def set_websocket(self, client: FastAPIWebsocketClient):
         """Set/Update the WebSocket connection.
 
         This method will start background tasks to read from the new WebSocket connection.
         """
-        self._websocket = websocket
         await self._stop_websocket_tasks()
+        self._client = client
         await self._start_websocket()
 
     async def _start_websocket(self):
@@ -192,26 +309,22 @@ class ACEInputTransport(BaseInputTransport):
 
         This method will start background tasks to read from the WebSocket connection.
         """
-        if self._params.session_timeout:
+        await self._client.setup(self._start_frame)
+        if not self._monitor_websocket_task and self._params.session_timeout:
             self._monitor_websocket_task = self.create_task(self._monitor_websocket())
-        await self._callbacks.on_client_connected(self._websocket)
-        self._receive_websocket_task = self.create_task(self._receive_websocket_messages())
+        await self._client.trigger_client_connected()
+        if not self._receive_task:
+            self._receive_task = self.create_task(self._receive_websocket_messages())
 
     async def _stop_websocket_tasks(self):
-        if hasattr(self, "_monitor_websocket_task") and self._monitor_websocket_task:
+        if self._monitor_websocket_task:
             await self.cancel_task(self._monitor_websocket_task)
-        if hasattr(self, "_receive_websocket_task") and self._receive_websocket_task:
-            await self.cancel_task(self._receive_websocket_task)
-
-    def _iter_data(self) -> typing.AsyncIterator[bytes | str]:
-        """Iterate over the WebSocket connection.
-
-        This method will iterate over the WebSocket connection and return the data as a bytes or string.
-        """
-        if self._params.serializer.type == FrameSerializerType.BINARY:
-            return self._websocket.iter_bytes()
-        else:
-            return self._websocket.iter_text()
+            self._monitor_websocket_task = None
+        if self._receive_task:
+            await self.cancel_task(self._receive_task)
+            self._receive_task = None
+        if self._client:
+            await self._client.disconnect()
 
     async def _receive_websocket_messages(self):
         """Receive messages from the WebSocket connection.
@@ -219,7 +332,7 @@ class ACEInputTransport(BaseInputTransport):
         This method will receive messages from the WebSocket connection and push the frames to the pipeline.
         """
         try:
-            async for message in self._iter_data():
+            async for message in self._client.receive():
                 frame = await self._params.serializer.deserialize(message)
 
                 if not frame:
@@ -247,12 +360,12 @@ class ACEInputTransport(BaseInputTransport):
         except Exception as e:
             logger.error(f"{self} exception receiving data: {e.__class__.__name__} ({e})")
 
-        await self._callbacks.on_client_disconnected(self._websocket)
+        await self._client.trigger_client_disconnected()
 
     async def _monitor_websocket(self):
         """Wait for self._params.session_timeout seconds, if the websocket is still open, trigger timeout event."""
         await asyncio.sleep(self._params.session_timeout)
-        await self._callbacks.on_session_timeout(self._websocket)
+        await self._client.trigger_client_timout()
 
     ## Functions for RTSP
 
@@ -266,10 +379,12 @@ class ACEInputTransport(BaseInputTransport):
         self._process_rtsp_task = self.create_task(self._process_rtsp_task_handler())
 
     async def _stop_rtsp_tasks(self):
-        if hasattr(self, "_read_rtsp_task") and self._read_rtsp_task:
+        if self._read_rtsp_task:
             await self.cancel_task(self._read_rtsp_task)
-        if hasattr(self, "_process_rtsp_task") and self._process_rtsp_task:
+            self._read_rtsp_task = None
+        if self._process_rtsp_task:
             await self.cancel_task(self._process_rtsp_task)
+            self._process_rtsp_task = None
 
     async def _thread_task_handler(self):
         """This method will start background task to read from the RTSP stream and push to rtsp queue."""
@@ -361,16 +476,25 @@ class ACEOutputTransport(BaseOutputTransport):
         - Connection state management
     """
 
-    def __init__(self, params: ACETransportParams, websocket: WebSocket | None = None, **kwargs):
+    def __init__(
+        self,
+        transport: BaseTransport,
+        client: FastAPIWebsocketClient,
+        params: ACETransportParams,
+        **kwargs,
+    ):
         """Initialize the ACEOutputTransport.
 
         Args:
             params: Transport configuration parameters.
-            websocket: Optional WebSocket connection.
+            transport: Transport instance.
+            client: WebSocket client instance.
             **kwargs: Additional arguments passed to BaseOutputTransport.
         """
         super().__init__(params, **kwargs)
-        self._websocket = websocket
+
+        self._transport = transport
+        self._client = client
         self._params = params
 
         # write_raw_audio_frames() is called quickly, as soon as we get audio
@@ -380,6 +504,7 @@ class ACEOutputTransport(BaseOutputTransport):
         # computed on StartFrame.
         self._send_interval = 0
         self._next_send_time = 0
+        self._total_sent_interval = 0
 
     async def start(self, frame: StartFrame):
         """Start the output transport.
@@ -388,8 +513,12 @@ class ACEOutputTransport(BaseOutputTransport):
             frame: The StartFrame that triggered the start.
         """
         await super().start(frame)
+        self._start_frame = frame
+        if self._client:
+            await self._client.setup(frame)
         await self._params.serializer.setup(frame)
-        self._send_interval = (self._audio_chunk_size / self.sample_rate) / 2
+        self._send_interval = (self.audio_chunk_size / self.sample_rate) / 2
+        await self.set_transport_ready(frame)
 
     async def stop(self, frame: EndFrame):
         """Stop the output transport and cleanup resources.
@@ -398,8 +527,8 @@ class ACEOutputTransport(BaseOutputTransport):
             frame: The EndFrame that triggered the stop.
         """
         await super().stop(frame)
-        if self._websocket and self._websocket.state == WebSocketState.CONNECTED:
-            self._websocket.close()
+        if self._client:
+            await self._client.disconnect()
 
     async def cancel(self, frame: CancelFrame):
         """Cancel the output transport and cleanup resources.
@@ -408,8 +537,16 @@ class ACEOutputTransport(BaseOutputTransport):
             frame: The CancelFrame that triggered the cancellation.
         """
         await super().cancel(frame)
-        if self._websocket and self._websocket.state == WebSocketState.CONNECTED:
-            self._websocket.close()
+        if self._client:
+            await self._client.disconnect()
+
+    async def cleanup(self):
+        """Cleanup the output transport and resources.
+
+        This method will cleanup the output transport and resources.
+        """
+        await super().cleanup()
+        await self._transport.cleanup()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process the frame.
@@ -420,7 +557,8 @@ class ACEOutputTransport(BaseOutputTransport):
 
         if isinstance(frame, StartInterruptionFrame):
             self._next_send_time = 0
-        if not isinstance(frame, OutputAudioRawFrame):
+            self._total_sent_interval = 0
+        if not isinstance(frame, AudioRawFrame | TransportMessageFrame | TransportMessageUrgentFrame):
             await self._write_frame(frame)
 
     async def send_message(self, frame: TransportMessageFrame | TransportMessageUrgentFrame):
@@ -431,21 +569,28 @@ class ACEOutputTransport(BaseOutputTransport):
         """
         await self._write_frame(frame)
 
-    async def set_websocket(self, websocket: WebSocket):
+    async def set_websocket(self, client: FastAPIWebsocketClient):
         """Set/Update the WebSocket connection."""
-        self._websocket = websocket
+        if self._client:
+            await self._client.disconnect()
+        self._client = client
+        await self._client.setup(self._start_frame)
 
-    async def write_raw_audio_frames(self, frames: bytes) -> None:
+    async def write_raw_audio_frames(self, frames: bytes, destination: str | None = None):
         """Writes audio frames to WebSocket with timing control.
 
         Args:
             frames: Raw audio data to transmit.
+            destination: The destination to write the audio frames to.
 
         Note:
             Simulates audio device timing to prevent flooding
             the network connection with audio data.
         """
-        if not self._websocket or self._websocket.client_state != WebSocketState.CONNECTED:
+        if not self._client or self._client.is_closing:
+            return
+
+        if not self._client.is_connected:
             # Simulate audio playback with a sleep.
             await self._write_audio_sleep()
             return
@@ -472,25 +617,22 @@ class ACEOutputTransport(BaseOutputTransport):
 
         await self._write_frame(frame)
 
-        # Simulate audio playback with a sleep.
-        await self._write_audio_sleep()
+        # To avoid the audio breaks/glitches during playback, we want to send
+        # the audio data in burst mode initially for some duration
+        # and then sleep to simulate the audio playback. This will ensure
+        # that there is some audio data always in the buffer and it is never empty.
+        if self._total_sent_interval >= self._params.burst_mode_duration:
+            # Simulate audio playback with a sleep.
+            await self._write_audio_sleep()
+        self._total_sent_interval += self._send_interval
 
     async def _write_frame(self, frame: Frame):
-        if not self._websocket or self._websocket.state == WebSocketState.DISCONNECTED:
-            logger.debug(f"No websocket available, unable to send frame {frame.name}")
-            return
         try:
             payload = await self._params.serializer.serialize(frame)
             if payload:
-                await self._send_data(payload)
+                await self._client.send(payload)
         except Exception as e:
-            logger.error(f"{self} exception sending data {frame.name}: {e.__class__.__name__} ({e})")
-
-    async def _send_data(self, data: str | bytes):
-        if self._params.serializer.type == FrameSerializerType.BINARY:
-            return await self._websocket.send_bytes(data)
-        else:
-            return await self._websocket.send_text(data)
+            logger.error(f"{self} exception sending data: {e.__class__.__name__} ({e})")
 
     async def _write_audio_sleep(self):
         # Simulate a clock.
@@ -501,13 +643,6 @@ class ACEOutputTransport(BaseOutputTransport):
             self._next_send_time = time.monotonic() + self._send_interval
         else:
             self._next_send_time += self._send_interval
-
-    async def _bot_stopped_speaking(self):
-        if self._bot_speaking:
-            logger.debug("Bot stopped speaking")
-            await self.push_frame(BotStoppedSpeakingFrame())
-            await self.push_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
-            self._bot_speaking = False
 
 
 class ACETransport(BaseTransport):
@@ -536,21 +671,49 @@ class ACETransport(BaseTransport):
             output_name: Optional name for output transport.
         """
         super().__init__(input_name=input_name, output_name=output_name)
+
         self._params = params
+
         self._callbacks = FastAPIWebsocketCallbacks(
             on_client_connected=self._on_client_connected,
             on_client_disconnected=self._on_client_disconnected,
             on_session_timeout=self._on_session_timeout,
         )
 
-        self._input = ACEInputTransport(self._params, self._callbacks, websocket=websocket, name=self._input_name)
-        self._output = ACEOutputTransport(self._params, websocket=websocket, name=self._output_name)
+        self._client = self.create_websocket_client(websocket)
+        self._input = ACEInputTransport(self, self._client, self._params, name=self._input_name)
+        self._output = ACEOutputTransport(self, self._client, self._params, name=self._output_name)
 
         # Register supported handlers. The user will only be able to register
         # these handlers.
         self._register_event_handler("on_client_connected")
         self._register_event_handler("on_client_disconnected")
         self._register_event_handler("on_session_timeout")
+
+    def create_websocket_client(self, websocket: WebSocket):
+        """Create a new WebSocket client.
+
+        Args:
+            websocket: The WebSocket connection.
+
+        Returns:
+            FastAPIWebsocketClient: The new WebSocket client.
+        """
+        if not websocket:
+            return None
+        else:
+            is_binary = self._params.serializer.type == FrameSerializerType.BINARY
+            return FastAPIWebsocketClient(websocket, is_binary, self._callbacks)
+
+    async def update_websocket(self, websocket: WebSocket):
+        """Update the WebSocket connection.
+
+        Args:
+            websocket: The new WebSocket connection.
+        """
+        self._client = self.create_websocket_client(websocket)
+        await self._input.set_websocket(self._client)
+        await self._output.set_websocket(self._client)
 
     def input(self) -> ACEInputTransport:
         """Get the input transport instance.

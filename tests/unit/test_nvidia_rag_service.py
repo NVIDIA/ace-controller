@@ -3,7 +3,7 @@
 
 """Unit tests for the NvidiaRAGService processor."""
 
-import aiohttp
+import httpx
 import pytest
 from loguru import logger
 from pipecat.frames.frames import ErrorFrame, LLMMessagesFrame, TextFrame
@@ -16,36 +16,11 @@ from nvidia_pipecat.services.nvidia_rag import NvidiaRAGService
 from tests.unit.utils import FrameStorage, ignore_ids, run_interactive_test, run_test
 
 
-class Content:
-    """Mock content class for testing response streaming.
-
-    Attributes:
-        data: The data to be streamed in chunks.
-    """
-
-    def __init__(self, data):
-        """Initialize Content with data.
-
-        Args:
-            data: The data to be streamed.
-        """
-        self.data = data
-
-    async def iter_chunks(self):
-        """Simulate chunk iteration for streaming response.
-
-        Yields:
-            tuple: A tuple containing encoded data and None.
-        """
-        yield self.data.encode("utf-8"), None
-
-
 class MockResponse:
     """Mock response class for testing HTTP responses.
 
     Attributes:
         json: The JSON response data.
-        content: Content instance for streaming simulation.
     """
 
     def __init__(self, json):
@@ -55,19 +30,18 @@ class MockResponse:
             json: The JSON response data.
         """
         self.json = json
-        self.content = Content(json)
 
-    async def __aexit__(self, arg1, arg2, arg3):
-        """Async context manager exit method."""
+    async def aclose(self):
+        """Mock aclose method."""
         pass
 
-    async def __aenter__(self):
-        """Async context manager enter method.
+    async def aiter_lines(self):
+        """Simulate chunk iteration for streaming response.
 
-        Returns:
-            MockResponse: Returns self for context manager.
+        Yields:
+            tuple: A tuple containing data and None.
         """
-        return self
+        yield self.json
 
 
 @pytest.mark.asyncio
@@ -183,7 +157,7 @@ async def test_nvidia_rag_service(mocker):
         else:
             resp = MockResponse("{}")
 
-        mocker.patch("aiohttp.ClientSession.post", return_value=resp)
+        mocker.patch("httpx.AsyncClient.post", return_value=resp)
 
         rag = NvidiaRAGService(collection_name=tc_data["collection_name"])
         storage1 = FrameStorage()
@@ -240,14 +214,14 @@ async def test_rag_service_sharing_session():
     for rag in rags:
         assert rag.shared_session is initial_session
 
-    new_session = aiohttp.ClientSession()
+    new_session = httpx.AsyncClient()
     rags.append(NvidiaRAGService(collection_name="collection_1", session=new_session))
 
     assert rags[0].shared_session is initial_session
     assert rags[1].shared_session is initial_session
     assert rags[2].shared_session is new_session
 
-    await new_session.close()
+    await new_session.aclose()
     for r in rags:
         await r.cleanup()
 
@@ -267,7 +241,7 @@ async def test_nvidia_rag_settings_frame_update(mocker):
         - Server URL updates
         - Settings frame propagation
     """
-    mocker.patch("aiohttp.ClientSession.post", return_value="")
+    mocker.patch("httpx.AsyncClient.post", return_value="")
 
     rag_settings_frame = NvidiaRAGSettingsFrame(
         settings={"collection_name": "nvidia_blogs", "rag_server_url": "http://10.41.23.247:8081"}

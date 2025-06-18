@@ -23,7 +23,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.ai_services import AIService
+from pipecat.services.ai_service import AIService
 from pipecat.transcriptions.language import Language
 
 try:

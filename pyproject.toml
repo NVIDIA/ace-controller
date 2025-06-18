@@ -1,6 +1,6 @@
 [project]
 name = "nvidia-pipecat"
-version = "0.1.0"
+version = "0.2.0"
 description = "NVIDIA ACE Pipecat SDK"
 readme = "NVIDIA_PIPECAT.md"
 license = { file = "LICENSE" }
@@ -12,10 +12,8 @@ dependencies = [
     "av>=13.0.0",
     "fastapi>=0.115.7",
     "hatchling>=1.27.0",
-    "nvidia-riva-client>=2.18.0",
     "onnxruntime>=1.20.1",
     "openai>=1.58.1",
-    "pipecat-ai==0.0.57",
     "sentence-transformers>=3.3.1",
     "torch>=2.5.1",
     "python-dotenv>=1.0.1",
@@ -30,6 +28,8 @@ dependencies = [
     "nvidia-animation-graph==1.1.0",
     "opentelemetry-sdk>=1.31.0",
     "opentelemetry-instrumentation-grpc>=0.52b0",
+    "nvidia-riva-client==2.20.0",
+    "pipecat-ai==0.0.68",
 ]
 
 [build-system]
@@ -40,7 +40,7 @@ build-backend = "hatchling.build"
 packages = ["src/nvidia_pipecat"]
 
 [tool.uv.sources]
-torch = { index = "pytorch" }
+torch = { index = "pytorch", marker = "sys_platform != 'darwin'" }
 
 [[tool.uv.index]]
 name = "pytorch"
